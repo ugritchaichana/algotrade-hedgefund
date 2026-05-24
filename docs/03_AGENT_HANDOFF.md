@@ -1,13 +1,21 @@
 # Agent Handoff & Quickstart Guide
-**Target Audience**: Future AI Agents (Claude / Cursor / AlgoTrade / etc.) entering this codebase.
+**Target Audience**: Future AI Agents (Claude / Cursor / etc.) entering this codebase.
 
 ## Welcome, Agent
 
 This is **AlgoTrade HedgeFund v2.1** — a Triple Screen Multi-Timeframe trend-following auto-trader for MetaTrader 5. Pure technical strategy. LLM is informational only (does NOT gate trades).
 
+**FIRST**: Read `NEXT_SESSION.md` (project root) — has current state + priority tasks + known bugs.
+**THEN**: This file for codebase orientation.
+
 **Authoritative rules:** `CLAUDE.md` at repo root. Read it before any code change.
-**Architecture:** `docs/02_TECHNICAL_ARCHITECTURE.md`
+**Master roadmap:** `docs/00_ROADMAP.md` — 9 phases from validation to public.
 **Strategy spec:** `docs/01_BUSINESS_REQUIREMENTS.md`
+**Architecture:** `docs/02_TECHNICAL_ARCHITECTURE.md`
+
+**Current phase:** Phase 1 (Live Trailing Parity) — backend `trade_manager.py` only does
+breakeven. Full state machine is in `backtest_engine._advance_trailing` only. Until parity
+is achieved, live results can't be compared to backtest projection. See `docs/04_PHASE_4_IMPLEMENTATION.md` for ready-to-apply code.
 
 ## 1. Project Context (1-minute version)
 

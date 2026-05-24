@@ -1,7 +1,24 @@
+# START HERE — New Session Bootstrap
+
+**If you're a fresh agent: read `NEXT_SESSION.md` (project root) FIRST.** It has current state,
+priority tasks, what NOT to touch, and known bugs. Spending 2 minutes there saves an hour
+of confused tool calls.
+
+Then read in this order:
+1. This file (`CLAUDE.md`) — coding rules + Tuning History + invariants
+2. `docs/00_ROADMAP.md` — master 9-phase roadmap, current phase
+3. `docs/01_BUSINESS_REQUIREMENTS.md` — strategy spec + Run 1-8 backtest history
+4. `~/.claude/projects/.../memory/current-state.md` — latest deployment state
+5. Task-specific: `docs/04` (Phase 1 work), `docs/05` (CI/CD), `docs/07` (ops), `docs/08` (backend code ref)
+
 # System & Context
 You are working on the **AlgoTrade HedgeFund System v2.1**.
 This is a local Algorithmic Trading Screener + Auto-Execution bot for MetaTrader 5 (MT5).
 The live engine is `backend/app/main.py` (FastAPI + APScheduler). There is no standalone `bot_runner.py`.
+
+**Project status (2026-05-24):** Phase 0 (backtest validation) done via 8 runs. Run 3 params chosen
+as deployable. Phase 1 (live trailing parity) is NEXT — required before any real-money deployment.
+See `docs/00_ROADMAP.md` for full plan.
 
 # Realistic expectations
 This is a **pure technical** trend-following system. Realistic targets:

@@ -79,6 +79,7 @@ run_all_followups.py
 
 # Session-specific notes (personal context, not for public repo)
 WAKE_UP.md
+NEXT_SESSION.md
 session_report_*.html
 
 # Claude local cache (per-machine, do not commit)
