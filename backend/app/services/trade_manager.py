@@ -1,68 +1,131 @@
+"""Trade Manager — manages open positions via full 4-stage trailing state machine.
+
+Called every H1 boundary (or more frequently if desired) by APScheduler.
+
+Mirrors backtest_engine._advance_trailing exactly to keep live behavior in sync with
+backtest projections.
+
+State machine (BUY direction; SELL mirrors):
+  stage 0: initial
+  stage 1 (>= 1.0R): SL -> breakeven
+  stage 2 (>= 1.5R): partial close 50% volume + SL -> +0.5R
+  stage 3 (>= 2.0R): trailing SL = max_favorable - 1.0 * ATR
+  stage 4 (>= 3.0R): tighter trail at max_favorable - 0.5 * ATR
+"""
+
+import logging
+import datetime
 import MetaTrader5 as mt5
-from app.services.mt5_connector import get_active_orders, resolve_symbol
-from app.core.database import SessionLocal, TradeState, log_action
+from app.core.database import SessionLocal, TradeState, TradeJournalEntry, log_action
+from app.services.execution_desk import modify_position_sl, partial_close_position
+
+log = logging.getLogger(__name__)
+
 
 def manage_active_trades():
-    """
-    Called every H1 interval to manage trailing stops and breakeven migration.
-    """
+    """Called every H1 boundary by scheduler."""
     positions = mt5.positions_get()
-    if positions is None:
+    if positions is None or len(positions) == 0:
         return
-        
+
     db = SessionLocal()
     try:
         for pos in positions:
-            sym = pos.symbol
-            profit = pos.profit
-            entry = pos.price_open
-            sl = pos.sl
-            tp = pos.tp
-            ticket = pos.ticket
-            
-            # Fetch TradeState to get Initial SL distance
-            state = db.query(TradeState).filter(TradeState.ticket == ticket).first()
-            if not state:
-                continue
-                
-            initial_sl_distance = abs(state.entry_price - state.sl)
-            if initial_sl_distance == 0:
-                continue
-                
-            # Check Breakeven Migration (1.0x D_SL)
-            # Assuming profit is in account currency, but let's use price distance
-            current_price = pos.price_current
-            price_distance = abs(current_price - entry)
-            
-            is_buy = pos.type == mt5.ORDER_TYPE_BUY
-            
-            # Breakeven Migration logic
-            if price_distance >= initial_sl_distance:
-                # Need to move SL to breakeven if not already there or better
-                if is_buy and sl < entry:
-                    _modify_sl(ticket, sym, entry)
-                    log_action("TradeManager", "Breakeven", f"Moved SL to entry for {sym} (Ticket {ticket})")
-                elif not is_buy and sl > entry:
-                    _modify_sl(ticket, sym, entry)
-                    log_action("TradeManager", "Breakeven", f"Moved SL to entry for {sym} (Ticket {ticket})")
-                    
-            # Basic Chandelier Exit could be implemented here as well
-            
+            try:
+                _manage_one(db, pos)
+            except Exception as e:
+                log.exception("manage_one failed for ticket %s: %s", pos.ticket, e)
     finally:
         db.close()
 
-def _modify_sl(ticket, symbol, new_sl):
-    request = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "position": ticket,
-        "symbol": symbol,
-        "sl": float(new_sl),
-        "tp": 0.0, # Keep existing TP? MT5 requires TP to be set if modifying SL, need to check
-    }
-    
-    # We need to get current TP to preserve it
-    pos = mt5.positions_get(ticket=ticket)
-    if pos:
-        request["tp"] = pos[0].tp
-        
-    mt5.order_send(request)
+
+def _manage_one(db, pos) -> None:
+    state = db.query(TradeState).filter(TradeState.ticket == pos.ticket).first()
+    if not state:
+        log.warning("No TradeState for ticket %s — orphaned position", pos.ticket)
+        return
+
+    is_buy = pos.type == mt5.ORDER_TYPE_BUY
+    current = pos.price_current
+
+    # 1) Update max_favorable
+    if is_buy:
+        new_max = max(state.max_favorable, current)
+    else:
+        new_max = min(state.max_favorable, current) if state.max_favorable > 0 else current
+    if new_max != state.max_favorable:
+        state.max_favorable = new_max
+
+    # 2) Compute R multiple based on max_favorable (best progress so far)
+    d = state.initial_sl_distance
+    if d <= 0:
+        return
+    if is_buy:
+        r = (state.max_favorable - state.entry_price) / d
+    else:
+        r = (state.entry_price - state.max_favorable) / d
+
+    new_sl = state.sl  # default: no change
+    new_stage = state.trail_stage
+
+    # Stage 1 — breakeven at 1.0R
+    if r >= 1.0 and state.trail_stage < 1:
+        new_sl = state.entry_price
+        new_stage = 1
+        log_action("TradeManager", "Stage1_Breakeven", f"{pos.symbol} ticket={pos.ticket} R={r:.2f}")
+
+    # Stage 2 — partial close 50% + lock SL at +0.5R
+    if r >= 1.5 and state.trail_stage < 2 and not state.partial_closed:
+        half_volume = round(state.initial_volume * 0.5, 2)
+        if half_volume >= 0.01:  # MT5 min lot
+            ok = partial_close_position(pos.ticket, pos.symbol, half_volume)
+            if ok:
+                state.partial_closed = True
+                lock_distance = 0.5 * d
+                lock_price = state.entry_price + lock_distance if is_buy else state.entry_price - lock_distance
+                new_sl = max(state.sl, lock_price) if is_buy else min(state.sl, lock_price)
+                new_stage = 2
+                log_action("TradeManager", "Stage2_PartialClose", f"{pos.symbol} ticket={pos.ticket} closed {half_volume} lot, SL locked at +0.5R")
+
+    # Stage 3 — trailing at max_favorable - 1*ATR
+    if r >= 2.0 and state.trail_stage < 3 and state.entry_atr > 0:
+        trail = state.max_favorable - state.entry_atr if is_buy else state.max_favorable + state.entry_atr
+        new_sl = max(state.sl, trail) if is_buy else min(state.sl, trail)
+        new_stage = 3
+
+    # Stage 4 — tighter trail at 0.5*ATR
+    if r >= 3.0 and state.trail_stage < 4 and state.entry_atr > 0:
+        trail = state.max_favorable - 0.5 * state.entry_atr if is_buy else state.max_favorable + 0.5 * state.entry_atr
+        new_sl = max(state.sl, trail) if is_buy else min(state.sl, trail)
+        new_stage = 4
+
+    # Continuous trail in stage 3+ (catches new highs even without stage transition)
+    if state.trail_stage >= 3 and state.entry_atr > 0:
+        atr_mult = 0.5 if state.trail_stage == 4 else 1.0
+        trail = state.max_favorable - atr_mult * state.entry_atr if is_buy else state.max_favorable + atr_mult * state.entry_atr
+        new_sl = max(new_sl, trail) if is_buy else min(new_sl, trail)
+
+    # Commit changes
+    if new_stage != state.trail_stage:
+        state.trail_stage = new_stage
+    if abs(new_sl - state.sl) > 1e-6:
+        # Send SL modify via execution_desk (single-entry-point invariant)
+        ok = modify_position_sl(pos.ticket, pos.symbol, new_sl, pos.tp)
+        if ok:
+            state.sl = new_sl
+            log_action("TradeManager", "SL_Modified", f"{pos.symbol} ticket={pos.ticket} new_sl={new_sl:.5f} stage={new_stage}")
+
+    state.trailing_active = state.trail_stage >= 1
+    db.commit()
+
+
+def _close_journal_entry(db, ticket, exit_price, exit_reason, r_multiple, pnl, slippage_exit):
+    entry = db.query(TradeJournalEntry).filter(TradeJournalEntry.ticket == ticket).first()
+    if entry:
+        entry.closed_at = datetime.datetime.utcnow()
+        entry.exit_price = float(exit_price)
+        entry.exit_reason = exit_reason
+        entry.r_multiple = round(r_multiple, 3)
+        entry.pnl = round(pnl, 2)
+        entry.slippage_exit = round(slippage_exit, 2) if slippage_exit else None
+        db.commit()

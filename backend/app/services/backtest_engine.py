@@ -30,14 +30,14 @@ log = logging.getLogger(__name__)
 # Default strategy params
 # =========================
 DEFAULTS = {
-    # Walk-forward-validated values (2026-05-24 — IS PF 1.44 / OOS PF 1.62 / Robust)
-    "sl_atr_mult": 0.5,
+    # Walk-forward-validated values (2026-05-24 — Run 3: OOS PF 4.35 / Deploy Candidate)
+    "sl_atr_mult": 0.25,
     "tp_atr_mult": 4.0,
     "rsi_entry_low": 40.0,
     "rsi_entry_high": 55.0,
-    "sma_fast_period": 20,
-    "sma_slow_period": 50,
-    "vma_period": 20,
+    "sma_fast_period": 10,
+    "sma_slow_period": 60,
+    "vma_period": 15,
     "rsi_period": 14,
     "atr_period": 14,
     "pending_max_age_bars": 24,

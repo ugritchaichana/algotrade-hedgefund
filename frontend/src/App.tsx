@@ -136,13 +136,99 @@ function AppContent() {
   );
 }
 
+function PinOverlay({ onUnlocked }: { onUnlocked: () => void }) {
+  const [pin, setInput] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      // Need to use fetch directly or temporally set localStorage to avoid chicken-and-egg
+      const { setPin } = await import('./lib/api');
+      setPin(pin); // set it so apiPost picks it up
+      const { apiPost } = await import('./lib/api');
+      const res = await apiPost('/api/auth/pin', { pin });
+      if ((res as any).ok) {
+        onUnlocked();
+      } else {
+        setError('Invalid PIN');
+        setPin('');
+      }
+    } catch {
+      setError('Invalid PIN');
+      const { setPin } = await import('./lib/api');
+      setPin('');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+      <div className="bg-surface p-8 rounded-xl shadow-xl max-w-md w-full border border-surfaceLight">
+        <h1 className="text-2xl font-bold text-primary mb-2 text-center">AlgoTrade Command Center</h1>
+        <p className="text-textMuted mb-6 text-center text-sm">Please enter your PIN to access the dashboard.</p>
+        <form onSubmit={submit} className="flex flex-col gap-4">
+          <input
+            type="password"
+            value={pin}
+            onChange={e => setInput(e.target.value)}
+            placeholder="Enter PIN"
+            autoFocus
+            className="w-full bg-background border border-surfaceLight rounded-lg px-4 py-3 text-center text-xl tracking-widest focus:outline-none focus:border-primary text-text"
+          />
+          {error && <p className="text-danger text-sm text-center font-medium">{error}</p>}
+          <button
+            type="submit"
+            disabled={busy || !pin}
+            className="w-full bg-primary text-white font-bold py-3 rounded-lg hover:bg-blue-600 transition-colors disabled:opacity-50"
+          >
+            {busy ? 'Verifying...' : 'Unlock'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  const [unlocked, setUnlocked] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  React.useEffect(() => {
+    const checkPin = async () => {
+      const stored = localStorage.getItem('algo_pin');
+      if (stored) {
+        try {
+          const { apiPost } = await import('./lib/api');
+          const res = await apiPost('/api/auth/pin', { pin: stored });
+          if ((res as any).ok) {
+            setUnlocked(true);
+          }
+        } catch {
+          localStorage.removeItem('algo_pin');
+        }
+      }
+      setChecking(false);
+    };
+    checkPin();
+  }, []);
+
+  if (checking) return <div className="min-h-screen bg-background" />;
+
   return (
     <ErrorBoundary>
       <ToastProvider>
-        <Router>
-          <AppContent />
-        </Router>
+        {unlocked ? (
+          <Router>
+            <AppContent />
+          </Router>
+        ) : (
+          <PinOverlay onUnlocked={() => setUnlocked(true)} />
+        )}
       </ToastProvider>
     </ErrorBoundary>
   );

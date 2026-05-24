@@ -34,6 +34,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel
@@ -138,8 +140,8 @@ def _today_realized_pnl() -> float:
     deals = mt5.history_deals_get(midnight, now) or []
     total = 0.0
     for d in deals:
-        if d.type in (0, 1):  # BUY or SELL closing
-            total += d.profit
+        if d.entry == mt5.DEAL_ENTRY_OUT:  # BUY or SELL closing
+            total += d.profit + d.commission + d.swap
     return total
 
 
@@ -211,8 +213,12 @@ async def broadcast_tick_data():
         log.error("broadcast_tick_data failed: %s", e)
 
 
-async def background_quant_analysis():
+_uvicorn_loop = None
+
+def background_quant_analysis():
     """Hourly cron. Run trade manager + per-symbol signal + auto-trade pending limit orders."""
+    global _last_quant_scan_time
+    _last_quant_scan_time = datetime.datetime.utcnow()
     try:
         # Trade manager — breakeven SL migration
         try:
@@ -275,6 +281,13 @@ async def background_quant_analysis():
                                     sl=result.get("sl"),
                                     tp=result.get("tp"),
                                     volume=result.get("lot_size"),
+                                    initial_volume=result.get("lot_size"),
+                                    initial_sl_distance=abs(result.get("entry", 0) - result.get("sl", 0)),
+                                    max_favorable=result.get("entry"),
+                                    trail_stage=0,
+                                    partial_closed=False,
+                                    entry_atr=result.get("entry_atr", 0.0),
+                                    trailing_active=False,
                                 ))
                                 db.commit()
                             except Exception as dbe:
@@ -287,7 +300,11 @@ async def background_quant_analysis():
                 elif not signal.startswith("ENTRY"):
                     _last_notified_signal[sym] = None
 
-                await manager.broadcast({"type": "QUANT_UPDATE", "symbol": sym, "data": result})
+                if _uvicorn_loop:
+                    asyncio.run_coroutine_threadsafe(
+                        manager.broadcast({"type": "QUANT_UPDATE", "symbol": sym, "data": result}),
+                        _uvicorn_loop
+                    )
 
             except Exception as e:
                 log.error("quant scan failed for %s: %s", sym, e)
@@ -296,7 +313,7 @@ async def background_quant_analysis():
         log_action("Scheduler", "Quant Cron Failed", str(e))
 
 
-async def schedule_d1_ingest():
+def schedule_d1_ingest():
     try:
         for sym in get_core_assets():
             ingest_timeframe(sym, "D1")
@@ -304,7 +321,7 @@ async def schedule_d1_ingest():
         log.error("D1 ingest failed: %s", e)
 
 
-async def schedule_h4_ingest():
+def schedule_h4_ingest():
     try:
         for sym in get_core_assets():
             ingest_timeframe(sym, "H4")
@@ -312,7 +329,7 @@ async def schedule_h4_ingest():
         log.error("H4 ingest failed: %s", e)
 
 
-async def schedule_h1_ingest():
+def schedule_h1_ingest():
     try:
         for sym in get_core_assets():
             ingest_timeframe(sym, "H1")
@@ -323,6 +340,8 @@ async def schedule_h1_ingest():
 # ===== App lifecycle =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _uvicorn_loop
+    _uvicorn_loop = asyncio.get_running_loop()
     log.info("Starting up — init_db + MT5 + scheduler")
     init_db()
     init_mt5()
@@ -332,14 +351,23 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(schedule_d1_ingest, "cron", hour=0, minute=30, id="ingest_d1")
     scheduler.add_job(schedule_h4_ingest, "cron", minute=15, hour="*/4", id="ingest_h4")
     scheduler.add_job(schedule_h1_ingest, "cron", minute=2, id="ingest_h1")
-    scheduler.add_job(_gc_old_jobs, "interval", minutes=15, id="job_gc")
+    from app.services.equity_recorder import capture_snapshot
+    scheduler.add_job(
+        capture_snapshot,
+        'cron',
+        hour='0,4,8,12,16,20',
+        minute=2,
+        id='equity_snapshot',
+        coalesce=True,
+        misfire_grace_time=300,
+    )
     scheduler.start()
 
-    # Pre-warm signal data + first H1/H4/D1 ingest so users see real data immediately
-    asyncio.create_task(_safe_call(background_quant_analysis, "startup_quant_warmup"))
-    asyncio.create_task(_safe_call(schedule_d1_ingest, "startup_d1_ingest"))
-    asyncio.create_task(_safe_call(schedule_h4_ingest, "startup_h4_ingest"))
-    asyncio.create_task(_safe_call(schedule_h1_ingest, "startup_h1_ingest"))
+    # Pre-warm signal data + first H1/H4/D1 ingest via background threads so it doesn't block startup
+    scheduler.add_job(background_quant_analysis, id="startup_quant")
+    scheduler.add_job(schedule_d1_ingest, id="startup_d1")
+    scheduler.add_job(schedule_h4_ingest, id="startup_h4")
+    scheduler.add_job(schedule_h1_ingest, id="startup_h1")
 
     yield
 
@@ -359,6 +387,11 @@ async def _safe_call(coro_fn, label: str):
 app = FastAPI(title="AlgoTrade HedgeFund", version="2.0", lifespan=lifespan)
 
 # Restricted CORS — local-only deployment per user requirement
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -369,6 +402,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def pin_auth_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path
+    if path.startswith("/api") and not path.startswith("/api/auth/pin") and not path.startswith("/api/ws"):
+        pin = request.headers.get("x-pin")
+        correct_pin = get_setting("access_pin", "130944")
+        if pin != correct_pin:
+            log.warning(f"Auth failed. Received pin: {pin}, Expected: {correct_pin}, Path: {path}")
+            return JSONResponse(status_code=401, content={"error": "Unauthorized. Invalid PIN."})
+    return await call_next(request)
+
+class PinRequest(BaseModel):
+    pin: str
+
+@app.post("/api/auth/pin")
+def verify_pin(payload: PinRequest):
+    correct_pin = get_setting("access_pin", "130944")
+    if payload.pin == correct_pin:
+        return {"ok": True}
+    return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid PIN"})
 
 app.include_router(ws_router, prefix="/api")
 
@@ -416,10 +472,6 @@ class OptimizeRequest(BaseModel):
     train_ratio: float = 0.67        # fraction of window used for training (0.4-0.9)
 
 
-# ===== Health + meta =====
-@app.get("/")
-def root():
-    return {"status": "Backend is running", "version": "2.0"}
 
 
 @app.get("/api/health")
@@ -1204,3 +1256,181 @@ def logs_range(start: str, end: str, limit: int = 5000, db: Session = Depends(ge
             for r in rows
         ],
     }
+
+
+@app.get("/api/equity/series")
+def equity_series(range: str = "30d"):
+    """Return equity snapshots + summary stats for the requested range."""
+    db = SessionLocal()
+    try:
+        q = db.query(EquitySnapshot).order_by(EquitySnapshot.recorded_at.asc())
+        if range != "all":
+            days = {"7d": 7, "30d": 30, "90d": 90}.get(range, 30)
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+            q = q.filter(EquitySnapshot.recorded_at >= cutoff)
+        rows = q.all()
+        if not rows:
+            return {"snapshots": [], "stats": None}
+        equities = [r.equity for r in rows]
+        start_eq = equities[0]
+        current_eq = equities[-1]
+        peak_eq = max(equities)
+        # Running max for DD
+        running_max = start_eq
+        max_dd = 0.0
+        for e in equities:
+            running_max = max(running_max, e)
+            dd = (running_max - e) / running_max * 100 if running_max > 0 else 0
+            max_dd = max(max_dd, dd)
+        current_dd = (peak_eq - current_eq) / peak_eq * 100 if peak_eq > 0 else 0
+        first_time = rows[0].recorded_at
+        last_time = rows[-1].recorded_at
+        days_tracked = (last_time - first_time).total_seconds() / 86400
+        return {
+            "snapshots": [
+                {
+                    "id": r.id,
+                    "recorded_at": r.recorded_at.isoformat(),
+                    "equity": r.equity,
+                    "balance": r.balance,
+                    "free_margin": r.free_margin,
+                    "open_positions": r.open_positions,
+                    "daily_pnl": r.daily_pnl,
+                } for r in rows
+            ],
+            "stats": {
+                "start_equity": start_eq,
+                "current_equity": current_eq,
+                "peak_equity": peak_eq,
+                "total_return_pct": (current_eq - start_eq) / start_eq * 100 if start_eq > 0 else 0,
+                "current_dd_pct": current_dd,
+                "max_dd_pct": max_dd,
+                "days_tracked": days_tracked,
+            }
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/journal")
+def journal_list(days: int = 30, symbol: str | None = None, side: str | None = None):
+    db = SessionLocal()
+    try:
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        q = db.query(TradeJournalEntry).filter(TradeJournalEntry.opened_at >= cutoff)
+        if symbol:
+            q = q.filter(TradeJournalEntry.symbol.ilike(f"%{symbol}%"))
+        if side:
+            q = q.filter(TradeJournalEntry.side == side)
+        rows = q.order_by(TradeJournalEntry.opened_at.desc()).limit(2000).all()
+        return {
+            "rows": [
+                {
+                    "id": r.id,
+                    "ticket": r.ticket,
+                    "symbol": r.symbol,
+                    "side": r.side,
+                    "opened_at": r.opened_at.isoformat(),
+                    "closed_at": r.closed_at.isoformat() if r.closed_at else None,
+                    "entry_price": r.entry_price,
+                    "exit_price": r.exit_price,
+                    "sl": r.sl,
+                    "tp": r.tp,
+                    "lot": r.lot,
+                    "exit_reason": r.exit_reason,
+                    "r_multiple": r.r_multiple,
+                    "pnl": r.pnl,
+                    "slippage_entry": r.slippage_entry,
+                    "slippage_exit": r.slippage_exit,
+                    "signal_context": json.loads(r.signal_context_json) if r.signal_context_json else None,
+                } for r in rows
+            ],
+            "count": len(rows),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/health/deep")
+def health_deep():
+    """Aggregate health check for monitoring + SystemHealth dashboard."""
+    import time
+    from sqlalchemy import text
+    started_at = _backend_started_at if "_backend_started_at" in globals() else datetime.datetime.utcnow().isoformat()
+
+    # Postgres ping
+    pg_ok = False
+    pg_latency = None
+    try:
+        t0 = time.time()
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        pg_latency = (time.time() - t0) * 1000
+        pg_ok = True
+    except Exception:
+        pass
+
+    # MT5 ping
+    mt5_health = check_terminal_health()  # already exists
+
+    # Scheduler jobs
+    jobs = []
+    if scheduler:
+        for j in scheduler.get_jobs():
+            jobs.append({
+                "id": j.id,
+                "next_run": j.next_run_time.isoformat() if j.next_run_time else None,
+                "last_run": None,  # APScheduler doesn't expose this directly; track via events if needed
+            })
+
+    # Today realized PnL (uses the bug-fixed version)
+    realized = _today_realized_pnl()
+
+    # DD limit check
+    dd_limit = float(get_setting("daily_dd_limit_pct", "5.0"))
+    info = mt5.account_info()
+    eq = info.get("equity", 10000) if info else 10000
+    dd_pct = abs(realized) / eq * 100 if realized < 0 and eq > 0 else 0
+    dd_hit = dd_pct >= dd_limit
+
+    # Last historical ingest per timeframe
+    last_ingest = {}
+    db = SessionLocal()
+    try:
+        for tf in ("D1", "H4", "H1"):
+            row = db.query(HistoricalData).filter(HistoricalData.timeframe == tf).order_by(HistoricalData.time.desc()).first()
+            last_ingest[tf] = row.time.isoformat() if row else None
+    finally:
+        db.close()
+
+    return {
+        "uvicorn_started_at": started_at,
+        "postgres": {"ok": pg_ok, "latency_ms": pg_latency},
+        "mt5": {
+            "ok": mt5_health.get("ok", False) if isinstance(mt5_health, dict) else False,
+            "trade_allowed": mt5_health.get("trade_allowed", False) if isinstance(mt5_health, dict) else False,
+            "ping_ms": mt5_health.get("ping_ms") if isinstance(mt5_health, dict) else None,
+        },
+        "scheduler": {"jobs": jobs},
+        "last_quant_scan": _last_quant_scan_time.isoformat() if "_last_quant_scan_time" in globals() and _last_quant_scan_time else None,
+        "last_ingest": last_ingest,
+        "auto_trade_enabled": get_setting("auto_trade_enabled", "true").lower() == "true",
+        "realized_pnl_today": round(realized, 2),
+        "daily_dd_limit_pct": dd_limit,
+        "daily_dd_limit_hit": dd_hit,
+        "core_assets_count": len(get_core_assets()),
+    }
+
+
+# ===== Serve React Frontend =====
+dist_path = os.path.join(os.path.dirname(__file__), "../../frontend/dist")
+if os.path.isdir(dist_path):
+    app.mount("/assets", StaticFiles(directory=os.path.join(dist_path, "assets")), name="assets")
+    
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        path = os.path.join(dist_path, full_path)
+        if os.path.isfile(path):
+            return FileResponse(path)
+        return FileResponse(os.path.join(dist_path, "index.html"))

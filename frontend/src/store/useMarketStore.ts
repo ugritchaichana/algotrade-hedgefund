@@ -22,7 +22,7 @@ interface MarketState {
   initializeWebSocket: () => void;
 }
 
-const CACHE_PREFIX = 'hf_v6_';  // bumped from v5 after schema changes; old keys cleaned on init
+const CACHE_PREFIX = 'hf_v7_';  // bumped from v6 after schema changes; old keys cleaned on init
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const WS_BACKOFF_BASE_MS = 1000;
 const WS_BACKOFF_MAX_MS = 30000;
@@ -33,7 +33,7 @@ function cleanLegacyCaches() {
     const stale: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && /^hf_v[1-5]_/.test(k)) stale.push(k);
+      if (k && /^hf_v[1-6]_/.test(k)) stale.push(k);
     }
     stale.forEach(k => localStorage.removeItem(k));
   } catch {

@@ -2,11 +2,11 @@
 
 Strategy logic
 ==============
-1. D1 macro trend (SMA 20/50) — establishes the long-term bias. Bullish when
-   close > SMA20 > SMA50, Bearish when close < SMA20 < SMA50, else Sideways.
-2. H4 medium-term confirmation (SMA 20/50) — must AGREE with D1. If D1 and H4
+1. D1 macro trend (SMA 10/60) — establishes the long-term bias. Bullish when
+   close > SMA10 > SMA60, Bearish when close < SMA10 < SMA60, else Sideways.
+2. H4 medium-term confirmation (SMA 10/60) — must AGREE with D1. If D1 and H4
    disagree or either is Sideways, no entry is generated.
-3. H1 entry trigger — RSI(14) + ATR(14) + tick_volume vs VMA(20). Entry is
+3. H1 entry trigger — RSI(14) + ATR(14) + tick_volume vs VMA(15). Entry is
    placed at the high/low of the previous CLOSED H1 candle (iloc[-2]) as a
    pending limit order — institutional pullback entry, no repaint.
 
@@ -25,7 +25,7 @@ oversold). Keep until backtest data invalidates it. See Phase 1C backtest engine
 Risk model
 ==========
 - 1% of EQUITY (not balance) per trade — drawdown-aware sizing.
-- SL = entry +/- 1.5x ATR. TP = entry +/- 3.0x ATR. Fixed 1:2 R:R.
+- SL = entry +/- 0.5x ATR. TP = entry +/- 4.0x ATR. (Validated via Run 1 walk-forward 2026-05-24).
 - risk_tolerance setting: Conservative=0.5% / Balanced=1.0% / Aggressive=2.0%.
 """
 
@@ -126,17 +126,17 @@ def calculate_lot_size(symbol: str, equity: float, risk_percent: float, sl_dista
 
 
 def _classify_trend(df, label: str) -> str:
-    """Bullish if close > SMA20 > SMA50, Bearish if close < SMA20 < SMA50, else Sideways."""
-    if df.empty or len(df) < 50:
+    """Bullish if close > SMA10 > SMA60, Bearish if close < SMA10 < SMA60, else Sideways."""
+    if df.empty or len(df) < 60:
         return "Insufficient"
-    sma20 = calculate_sma(df, 20).iloc[-1]
-    sma50 = calculate_sma(df, 50).iloc[-1]
+    sma10 = calculate_sma(df, 10).iloc[-1]
+    sma60 = calculate_sma(df, 60).iloc[-1]
     close = df.iloc[-1]["close"]
-    if pd.isna(sma20) or pd.isna(sma50):
+    if pd.isna(sma10) or pd.isna(sma60):
         return "Insufficient"
-    if close > sma20 > sma50:
+    if close > sma10 > sma60:
         return "Bullish"
-    if close < sma20 < sma50:
+    if close < sma10 < sma60:
         return "Bearish"
     return "Sideways"
 
@@ -270,7 +270,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
 
     df_h1["RSI_14"] = calculate_rsi(df_h1, 14)
     df_h1["ATR_14"] = calculate_atr(df_h1, 14)
-    df_h1["VMA_20"] = calculate_sma(df_h1, 20, column="tick_volume")
+    df_h1["VMA_15"] = calculate_sma(df_h1, 15, column="tick_volume")
 
     closed_h1 = df_h1.iloc[-2]  # last fully-closed bar
     current_h1 = df_h1.iloc[-1]
@@ -278,7 +278,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
     rsi = float(closed_h1["RSI_14"]) if not pd.isna(closed_h1["RSI_14"]) else 0.0
     atr = float(closed_h1["ATR_14"]) if not pd.isna(closed_h1["ATR_14"]) else 0.0
     current_vol = float(closed_h1["tick_volume"])
-    vma = float(closed_h1["VMA_20"]) if not pd.isna(closed_h1["VMA_20"]) else 0.0
+    vma = float(closed_h1["VMA_15"]) if not pd.isna(closed_h1["VMA_15"]) else 0.0
     base_response["trends"]["H1_rsi"] = round(rsi, 1)
 
     signal = "WAITING"
@@ -341,7 +341,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
                     confidence = 75
             else:
                 signal = "WAITING"
-                action_text = f"RSI {rsi:.1f} in entry zone, but H1 volume ({current_vol:.0f}) < VMA20 ({vma:.0f})."
+                action_text = f"RSI {rsi:.1f} in entry zone, but H1 volume ({current_vol:.0f}) < VMA15 ({vma:.0f})."
 
     elif macro_trend == "Bearish":
         confidence = 60
@@ -370,7 +370,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
                     confidence = 75
             else:
                 signal = "WAITING"
-                action_text = f"RSI {rsi:.1f} in entry zone, but H1 volume ({current_vol:.0f}) < VMA20 ({vma:.0f})."
+                action_text = f"RSI {rsi:.1f} in entry zone, but H1 volume ({current_vol:.0f}) < VMA15 ({vma:.0f})."
 
     regime_label = f"D1: {d1_trend} | H4: {h4_trend} | H1 RSI {rsi:.1f}"
     if not is_peak:
@@ -387,6 +387,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
         "confidence": confidence,
         "rsi": round(rsi, 1) if rsi else 0,
         "atr": round(atr, 4) if atr else 0,
+        "entry_atr": round(atr, 4) if atr else 0,
         "entry": round(entry_price, 4) if signal.startswith("ENTRY") else None,
         "sl": round(sl_price, 4) if signal.startswith("ENTRY") else None,
         "tp": round(tp_price, 4) if signal.startswith("ENTRY") else None,

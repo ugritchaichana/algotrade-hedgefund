@@ -76,6 +76,12 @@ class TradeState(Base):
     tp = Column(Float)
     volume = Column(Float)
     trailing_active = Column(Boolean, default=False)
+    initial_sl_distance = Column(Float, default=0.0)
+    max_favorable = Column(Float, default=0.0)
+    trail_stage = Column(Integer, default=0)
+    partial_closed = Column(Boolean, default=False)
+    entry_atr = Column(Float, default=0.0)
+    initial_volume = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(
         DateTime,
@@ -149,7 +155,12 @@ def _migrate_schema_if_needed():
 
     if inspector.has_table("trade_states"):
         cols = {c["name"]: c for c in inspector.get_columns("trade_states")}
-        if "trailing_active" in cols:
+        # Check for new Phase 1 columns
+        expected_cols = {"initial_sl_distance", "max_favorable", "trail_stage"}
+        if not expected_cols.issubset(set(cols.keys())):
+            log.warning("trade_states missing Phase 1 columns — dropping for recreate")
+            drops.append(TradeState.__table__)
+        elif "trailing_active" in cols:
             # SQLAlchemy reports types via .type — accept Boolean OR any String<->Bool migration we just did
             type_str = str(cols["trailing_active"]["type"]).upper()
             if "VARCHAR" in type_str or "STRING" in type_str:
@@ -199,6 +210,7 @@ def _seed_default_settings() -> None:
             "discord_webhook": "",
             "max_open_positions": "5",
             "max_daily_drawdown_pct": "3.0",
+            "access_pin": "130944",
         }
         existing = {row.key for row in db.query(SystemSettings).all()}
         for key, value in defaults.items():

@@ -27,7 +27,13 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @router.websocket("/ws/market")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, pin: str = None):
+    from app.main import get_setting
+    correct_pin = get_setting("access_pin", "130944")
+    if pin != correct_pin:
+        await websocket.close(code=1008)
+        return
+
     await manager.connect(websocket)
     try:
         while True:

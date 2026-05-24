@@ -133,4 +133,97 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
         f"Trade executed: **{symbol}** {signal} | Lot {lot} | Entry {entry} | SL {sl} | TP {tp} | Ticket {result.order}"
     )
 
+    # Write initial TradeJournalEntry
+    import json
+    import datetime
+    from app.core.database import SessionLocal, TradeJournalEntry
+    db = SessionLocal()
+    try:
+        journal = TradeJournalEntry(
+            ticket=result.order,
+            symbol=symbol,
+            side="BUY" if "BUY" in signal else "SELL",
+            opened_at=datetime.datetime.utcnow(),
+            entry_price=float(entry),
+            exit_price=None,
+            sl=float(sl),
+            tp=float(tp),
+            lot=float(lot),
+            exit_reason=None,
+            r_multiple=None,
+            pnl=None,
+            slippage_entry=None,
+            signal_context_json=json.dumps({
+                "d1_trend": signal_data.get("d1_trend"),
+                "h4_trend": signal_data.get("h4_trend"),
+                "h1_rsi": signal_data.get("h1_rsi"),
+                "h1_volume": signal_data.get("h1_volume"),
+                "h1_vma": signal_data.get("h1_vma"),
+                "atr": signal_data.get("entry_atr"),
+            }),
+        )
+        db.add(journal)
+        db.commit()
+    except Exception as e:
+        log.exception("execute_trade: failed to write TradeJournalEntry: %s", e)
+    finally:
+        db.close()
+
     return {"success": True, "ticket": int(result.order), "error": None, "reason": "ok"}
+
+
+def modify_position_sl(ticket: int, symbol: str, new_sl: float, current_tp: float) -> bool:
+    """Modify position SL via TRADE_ACTION_SLTP. Returns True on success."""
+    resolved = resolve_symbol(symbol)
+    if not resolved:
+        log.error("modify_position_sl: cannot resolve symbol %s", symbol)
+        return False
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "symbol": resolved,
+        "sl": float(new_sl),
+        "tp": float(current_tp),
+    }
+    result = mt5.order_send(request)
+    if not result or result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.warning("modify_position_sl failed: ticket=%s retcode=%s comment=%s",
+                    ticket, getattr(result, "retcode", None), getattr(result, "comment", None))
+        return False
+    return True
+
+
+def partial_close_position(ticket: int, symbol: str, volume_to_close: float) -> bool:
+    """Close `volume_to_close` lots of the position (opposite-side market order).
+
+    Returns True on success. Uses TRADE_ACTION_DEAL with opposite side.
+    """
+    resolved = resolve_symbol(symbol)
+    pos = mt5.positions_get(ticket=ticket)
+    if not pos:
+        return False
+    p = pos[0]
+    is_buy = p.type == mt5.ORDER_TYPE_BUY
+    close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+    tick = mt5.symbol_info_tick(resolved)
+    if not tick:
+        return False
+    price = tick.bid if is_buy else tick.ask
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": resolved,
+        "volume": float(volume_to_close),
+        "type": close_type,
+        "position": ticket,
+        "price": price,
+        "deviation": 20,  # 2 pips slippage tolerance
+        "magic": MAGIC_NUMBER,
+        "comment": "AlgoTrade Partial Close",
+    }
+    result = mt5.order_send(request)
+    if not result or result.retcode != mt5.TRADE_RETCODE_DONE:
+        log.warning("partial_close failed: ticket=%s retcode=%s comment=%s",
+                    ticket, getattr(result, "retcode", None), getattr(result, "comment", None))
+        return False
+    log.info("Partial close: ticket=%s volume=%s", ticket, volume_to_close)
+    return True
