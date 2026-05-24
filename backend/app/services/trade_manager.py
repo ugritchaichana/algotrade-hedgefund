@@ -129,3 +129,78 @@ def _close_journal_entry(db, ticket, exit_price, exit_reason, r_multiple, pnl, s
         entry.pnl = round(pnl, 2)
         entry.slippage_exit = round(slippage_exit, 2) if slippage_exit else None
         db.commit()
+
+
+def sync_closed_positions():
+    """Scans for open TradeJournalEntry rows that no longer have an active MT5 position, and closes them."""
+    db = SessionLocal()
+    try:
+        # Find all open trades in our DB
+        open_trades = db.query(TradeJournalEntry).filter(TradeJournalEntry.closed_at == None).all()
+        if not open_trades:
+            return
+            
+        # Get all active tickets in MT5 right now
+        active_positions = mt5.positions_get()
+        active_tickets = {p.ticket for p in (active_positions or [])}
+        
+        for trade in open_trades:
+            if trade.ticket not in active_tickets:
+                # The trade is no longer active in MT5, it must be closed!
+                _process_closed_trade(db, trade)
+                
+    except Exception as e:
+        log.error("sync_closed_positions failed: %s", e)
+    finally:
+        db.close()
+
+
+def _process_closed_trade(db, trade):
+    from app.services.discord_notifier import notify_trade_closed
+    from app.core.database import TradeState
+    
+    now = datetime.datetime.utcnow()
+    from_date = now - datetime.timedelta(days=30)
+    deals = mt5.history_deals_get(from_date, now, position=trade.ticket)
+    
+    if not deals:
+        log.warning("sync_closed_positions: No deals found for closed ticket %s", trade.ticket)
+        return
+        
+    out_deals = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
+    if not out_deals:
+        return
+        
+    total_pnl = sum(d.profit + d.commission + d.swap for d in out_deals)
+    final_deal = sorted(out_deals, key=lambda x: x.time)[-1]
+    
+    exit_price = final_deal.price
+    
+    reason = "Manual/Trail"
+    if final_deal.reason == mt5.DEAL_REASON_SL:
+        reason = "Stop Loss"
+    elif final_deal.reason == mt5.DEAL_REASON_TP:
+        reason = "Take Profit"
+    elif final_deal.reason == mt5.DEAL_REASON_CLIENT:
+        reason = "Manual Close"
+        
+    r_multiple = 0.0
+    state = db.query(TradeState).filter(TradeState.ticket == trade.ticket).first()
+    if state and state.initial_sl_distance > 0:
+        if trade.side == "BUY":
+            r_multiple = (exit_price - trade.entry_price) / state.initial_sl_distance
+        else:
+            r_multiple = (trade.entry_price - exit_price) / state.initial_sl_distance
+            
+    _close_journal_entry(db, trade.ticket, exit_price, reason, r_multiple, total_pnl, 0.0)
+    
+    notify_trade_closed(
+        ticket=trade.ticket,
+        symbol=trade.symbol,
+        side=trade.side,
+        exit_price=exit_price,
+        pnl=total_pnl,
+        r_multiple=r_multiple,
+        exit_reason=reason
+    )
+    log.info("Synced closed position %s: PnL=%.2f R=%.2f", trade.ticket, total_pnl, r_multiple)

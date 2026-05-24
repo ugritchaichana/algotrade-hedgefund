@@ -210,6 +210,7 @@ def _seed_default_settings() -> None:
             "discord_webhook": "",
             "max_open_positions": "5",
             "max_daily_drawdown_pct": "3.0",
+            "max_daily_trades": "8",
             "access_pin": "130944",
         }
         existing = {row.key for row in db.query(SystemSettings).all()}

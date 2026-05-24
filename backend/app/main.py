@@ -190,6 +190,27 @@ def _safety_gates_pass(sym: str) -> tuple[bool, str]:
                 notify_safety_event("Daily DD Limit", msg)
                 return False, "daily_dd_limit"
 
+    # Gate 5: max daily trades
+    try:
+        max_daily_trades = int(get_setting("max_daily_trades", "8"))
+    except ValueError:
+        max_daily_trades = 8
+        
+    from app.core.database import SessionLocal, TradeJournalEntry
+    db = SessionLocal()
+    try:
+        today_start = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        trades_today = db.query(TradeJournalEntry).filter(TradeJournalEntry.created_at >= today_start).count()
+        if trades_today >= max_daily_trades:
+            msg = f"Max daily trades reached ({trades_today}/{max_daily_trades}) — auto-trade halted today"
+            log.warning(msg)
+            notify_safety_event("Daily Trade Cap Limit", msg)
+            return False, "max_daily_trades"
+    except Exception as e:
+        log.error("_safety_gates_pass db check failed: %s", e)
+    finally:
+        db.close()
+
     return True, "ok"
 
 
@@ -345,7 +366,13 @@ async def lifespan(app: FastAPI):
     log.info("Starting up — init_db + MT5 + scheduler")
     init_db()
     init_mt5()
+    
+    from app.services.discord_notifier import notify_system_startup
+    notify_system_startup()
 
+    from app.services.trade_manager import sync_closed_positions
+    scheduler.add_job(sync_closed_positions, "interval", minutes=5, id="sync_closed_positions")
+    
     scheduler.add_job(broadcast_tick_data, "interval", seconds=2, id="tick_broadcast")
     scheduler.add_job(background_quant_analysis, "cron", minute=0, second=5, id="quant_scan")
     scheduler.add_job(schedule_d1_ingest, "cron", hour=0, minute=30, id="ingest_d1")

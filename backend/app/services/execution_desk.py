@@ -14,7 +14,7 @@ Safety gates enforced here:
 import logging
 import MetaTrader5 as mt5
 from app.core.database import log_action
-from app.services.discord_notifier import send_discord_alert, notify_safety_event
+from app.services.discord_notifier import send_discord_alert, notify_safety_event, notify_trade_opened
 from app.services.mt5_connector import resolve_symbol
 from app.core.asset_profiles import ASSET_PROFILES
 
@@ -129,8 +129,14 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
     )
     log.info(success_msg)
     log_action("Execution Desk", "Trade Executed", success_msg)
-    send_discord_alert(
-        f"Trade executed: **{symbol}** {signal} | Lot {lot} | Entry {entry} | SL {sl} | TP {tp} | Ticket {result.order}"
+    notify_trade_opened(
+        ticket=int(result.order),
+        symbol=symbol,
+        side="BUY" if "BUY" in signal else "SELL",
+        entry_price=entry,
+        sl=sl,
+        tp=tp,
+        lot=lot
     )
 
     # Write initial TradeJournalEntry

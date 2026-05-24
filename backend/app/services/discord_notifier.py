@@ -107,3 +107,49 @@ def notify_safety_event(title: str, detail: str) -> bool:
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
     return send_discord_alert(f"Safety event: **{title}**", embed=embed)
+
+
+def notify_trade_opened(ticket: int, symbol: str, side: str, entry_price: float, sl: float, tp: float, lot: float) -> bool:
+    color = 0x00FF00 if side.upper() == "BUY" else 0xFF0000
+    embed = {
+        "title": f"TRADE OPENED: {symbol} ({side.upper()})",
+        "description": f"Successfully placed order. Ticket: #{ticket}",
+        "color": color,
+        "fields": [
+            {"name": "Entry Price", "value": str(entry_price), "inline": True},
+            {"name": "Stop Loss", "value": str(sl), "inline": True},
+            {"name": "Take Profit", "value": str(tp), "inline": True},
+            {"name": "Lot Size", "value": str(lot), "inline": True},
+        ],
+        "footer": {"text": "AlgoTrade HedgeFund System"},
+    }
+    return send_discord_alert(f"🟢 **{symbol}** trade successfully executed", embed=embed)
+
+
+def notify_trade_closed(ticket: int, symbol: str, side: str, exit_price: float, pnl: float, r_multiple: float, exit_reason: str) -> bool:
+    is_win = pnl > 0
+    color = 0x0088FF if is_win else 0xFF4444
+    icon = "🔵" if is_win else "🔴"
+    
+    embed = {
+        "title": f"TRADE CLOSED: {symbol} ({side.upper()})",
+        "description": f"Position #{ticket} closed. Reason: {exit_reason}",
+        "color": color,
+        "fields": [
+            {"name": "Exit Price", "value": str(exit_price), "inline": True},
+            {"name": "Net PnL", "value": f"${pnl:.2f}", "inline": True},
+            {"name": "R-Multiple", "value": f"{r_multiple:.2f}R", "inline": True},
+        ],
+        "footer": {"text": "AlgoTrade HedgeFund System"},
+    }
+    return send_discord_alert(f"{icon} **{symbol}** trade closed via {exit_reason} (PnL: ${pnl:.2f})", embed=embed)
+
+
+def notify_system_startup(version: str = "v2.1") -> bool:
+    embed = {
+        "title": "System Startup",
+        "description": f"AlgoTrade HedgeFund {version} backend has started.",
+        "color": 0x888888,
+        "footer": {"text": "AlgoTrade HedgeFund System"},
+    }
+    return send_discord_alert("🚀 System online.", embed=embed)
