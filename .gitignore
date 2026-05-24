@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+backend/venv/
+venv/
+env/
+ENV/
+.venv
+
+# Secrets
+.env
+backend/.env
+*.env.local
+
+# Databases (dev/test artifacts)
+*.db
+*.sqlite
+*.sqlite3
+hedgefund.db
+
+# Node
+node_modules/
+.pnp
+.pnp.js
+
+# Frontend build output
+dist/
+build/
+.next/
+out/
+
+# Playwright
+playwright-report/
+test-results/
+playwright/.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Caches / artifacts that should never commit
+*_raw_output.json
+dashboard.png
+
+# Explore reports (auto-generated audits)
+explore-reports/
+
+# Backtest run artifacts (large + per-run, do not commit)
+run*_result.json
+run*_output.log
+run*_poll.log
+analyze_run*.py
+run5_monthly_sensitivity.py
+run6_spread_stress.py
+run7_per_asset_class.py
+run8_holdout_test.py
+run_all_followups.py
+
+# Session-specific notes (personal context, not for public repo)
+WAKE_UP.md
+session_report_*.html
+
+# Claude local cache (per-machine, do not commit)
+.claude/
+
+# Other artifacts
+uvicorn.log
+backend/logs/
+generate_session_report.py
+inspect-ui.mjs
+
+# AI agent rules (machine-specific, keep CLAUDE.md but skip ones that vary)
+.cursorrules
+.ai-context.md
+

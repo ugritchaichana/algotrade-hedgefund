@@ -1,0 +1,38 @@
+# AlgoTrade HedgeFund v2.1 — Python dependencies
+# Versions pinned to what's currently installed in the working venv (validated 2026-05-24).
+# Loose minor-version pins (~=) for tolerance to bug-fix updates.
+#
+# Install:
+#   cd backend
+#   python -m venv venv
+#   .\venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# === Web framework + ASGI server ===
+fastapi~=0.136.1
+uvicorn[standard]~=0.47.0
+pydantic>=2.0
+
+# === Database (Postgres + ORM) ===
+sqlalchemy>=2.0
+psycopg2-binary>=2.9          # PostgreSQL driver
+chromadb>=0.5                 # Vector DB for reflection memory
+
+# === MT5 trading API ===
+MetaTrader5~=5.0.5735         # Windows-only — provides terminal IPC
+
+# === Scheduler ===
+apscheduler>=3.10             # 2s tick broadcast + hourly cron jobs
+
+# === Data analysis ===
+pandas~=3.0.3
+numpy~=2.4.6
+
+# === HTTP + config ===
+requests~=2.34.2              # MiMo API, Discord webhook, ForexFactory news
+python-dotenv~=1.2.2          # Load backend/.env
+
+# === Notes ===
+# - The MetaTrader5 package is Windows-only. Don't install on macOS/Linux.
+# - psycopg2-binary works out-of-the-box on Windows; switch to psycopg2 if compiling from source.
+# - All other deps are cross-platform but the system as a whole requires Windows for MT5 IPC.
