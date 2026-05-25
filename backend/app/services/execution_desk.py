@@ -4,13 +4,15 @@ All auto-trade and manual-trade flows MUST go through `execute_trade` here.
 Direct callers of `mt5.order_send` are forbidden outside this module.
 
 Safety gates enforced here:
-  1. Symbol resolution (handle IUX broker aliases)
-  2. Spread protection (per-symbol max_spread from ASSET_PROFILES)
-  3. Swap cost warning (negative swap > 50 points triggers alert)
-  4. Duplicate position check (no doubling up in same direction)
-  5. Pending-limit placement (no market chasing)
+  1. Idempotency: same (symbol, signal, entry-bucket) cannot be re-sent within TTL window
+  2. Symbol resolution (handle IUX broker aliases)
+  3. Spread protection (per-symbol max_spread from ASSET_PROFILES)
+  4. Swap cost warning (negative swap > 50 points triggers alert)
+  5. Duplicate position check (no doubling up in same direction)
+  6. Pending-limit placement (no market chasing)
 """
 
+import time
 import logging
 import MetaTrader5 as mt5
 from app.core.database import log_action
@@ -22,6 +24,31 @@ log = logging.getLogger(__name__)
 
 MAGIC_NUMBER = 999999
 COMMENT = "AlgoTrade"
+
+# Idempotency cache — guards against duplicate order_send if MT5 ack times out and quant
+# loop retries. Key: (symbol, signal_type, entry_minute_bucket). Value: epoch_seconds.
+# Entries older than IDEMPOTENCY_TTL_SECONDS are pruned on every call.
+_recent_sends: dict[tuple[str, str, int], float] = {}
+IDEMPOTENCY_TTL_SECONDS = 300  # 5 minutes
+
+
+def _idempotency_key(symbol: str, signal: str, entry: float) -> tuple[str, str, int]:
+    """Bucket by entry price rounded to 4 decimals + per-minute epoch to absorb tiny price drift."""
+    return (symbol, signal, int(round(entry * 10000)))
+
+
+def _check_and_record_send(symbol: str, signal: str, entry: float) -> bool:
+    """Returns True if this send is fresh (proceed). False if duplicate within TTL (block)."""
+    now = time.time()
+    # Prune stale
+    stale = [k for k, ts in _recent_sends.items() if now - ts > IDEMPOTENCY_TTL_SECONDS]
+    for k in stale:
+        del _recent_sends[k]
+    key = _idempotency_key(symbol, signal, entry)
+    if key in _recent_sends:
+        return False
+    _recent_sends[key] = now
+    return True
 
 
 def has_open_position(symbol: str, signal_type: str) -> bool:
@@ -68,6 +95,15 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
         msg = f"{symbol}: existing {signal} position or pending order — skipping"
         log.info(msg)
         return {"success": False, "ticket": None, "error": msg, "reason": "duplicate"}
+
+    # Idempotency guard — same (symbol, signal, entry) cannot be re-sent within TTL.
+    # This catches the scenario where MT5 ACK times out, retcode is None, and the quant
+    # scheduler retries on the next tick before MT5 surfaces the original order.
+    if not _check_and_record_send(symbol, signal, entry):
+        msg = f"{symbol}: idempotency block — same {signal} at entry={entry} sent within {IDEMPOTENCY_TTL_SECONDS}s"
+        log.warning(msg)
+        log_action("Execution Desk", "Idempotency Block", msg)
+        return {"success": False, "ticket": None, "error": msg, "reason": "idempotent_duplicate"}
 
     resolved = resolve_symbol(symbol)
     info = mt5.symbol_info(resolved)

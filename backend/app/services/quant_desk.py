@@ -25,7 +25,7 @@ oversold). Keep until backtest data invalidates it. See Phase 1C backtest engine
 Risk model
 ==========
 - 1% of EQUITY (not balance) per trade — drawdown-aware sizing.
-- SL = entry +/- 0.5x ATR. TP = entry +/- 4.0x ATR. (Validated via Run 1 walk-forward 2026-05-24).
+- SL = entry +/- 0.25x ATR. TP = entry +/- 4.0x ATR. (Run 3 walk-forward + hold-out validated 2026-05-24; deployed 2026-05-26.)
 - risk_tolerance setting: Conservative=0.5% / Balanced=1.0% / Aggressive=2.0%.
 """
 
@@ -309,8 +309,8 @@ def determine_regime_and_signal(symbol: str) -> dict:
     risk_percent = _get_risk_percent()
 
     # === Strategy decision ===
-    # Walk-forward-validated thresholds (2026-05-24):
-    #   SL = 0.5×ATR (tight), TP = 4×ATR (wide; trailing usually exits first)
+    # Run 3 walk-forward + hold-out validated thresholds (deployed 2026-05-26):
+    #   SL = 0.25×ATR (very tight), TP = 4×ATR (wide; trailing usually exits first)
     #   RSI entry zone 40-55 (narrower than the v2.0 40-60 default)
     if macro_trend == "Bullish":
         confidence = 60
@@ -322,7 +322,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
             confidence = 75
             if current_vol > vma:
                 entry_price = float(closed_h1["low"])
-                sl_price = entry_price - (atr * 0.5)
+                sl_price = entry_price - (atr * 0.25)
                 tp_price = entry_price + (atr * 4.0)
                 sl_distance = entry_price - sl_price
                 lot_size = calculate_lot_size(symbol, equity, risk_percent, sl_distance)
@@ -353,7 +353,7 @@ def determine_regime_and_signal(symbol: str) -> dict:
             confidence = 75
             if current_vol > vma:
                 entry_price = float(closed_h1["high"])
-                sl_price = entry_price + (atr * 0.5)
+                sl_price = entry_price + (atr * 0.25)
                 tp_price = entry_price - (atr * 4.0)
                 sl_distance = sl_price - entry_price
                 lot_size = calculate_lot_size(symbol, equity, risk_percent, sl_distance)

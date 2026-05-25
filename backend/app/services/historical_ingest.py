@@ -8,10 +8,11 @@ Storage model: one row per (symbol, timeframe, time) — enforced by the unique
 constraint in app.core.database.HistoricalData. Re-runs are idempotent thanks
 to Postgres ON CONFLICT DO NOTHING.
 
-Initial backfill window per timeframe:
-  D1: 1000 candles (~3 years)
-  H4: 1000 candles (~6 months)
-  H1: 1000 candles (~6 weeks)
+Initial backfill window per timeframe (broker returns whatever it has up to this cap):
+  D1: 5000 candles (~14 years)
+  H4: 5000 candles (~2.5 years)
+  H1: 5000 candles (~7 months)
+  M1: 300000 candles (~7 months — actual depth depends on IUX broker history)
 Subsequent runs only fetch candles after the latest stored timestamp.
 """
 
@@ -43,7 +44,7 @@ INITIAL_BACKFILL = {
     "M30": 2000,
     "M15": 2000,
     "M5": 2000,
-    "M1": 2000,
+    "M1": 300000,  # ~7 months — broker returns whatever depth IUX provides
 }
 
 

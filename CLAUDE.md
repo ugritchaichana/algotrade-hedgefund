@@ -76,8 +76,14 @@ Default `core_assets` setting should be G1 only. Verify via `GET /api/config/ass
     before being applied via "Apply Winners" button. Optimize page → enable Walk-Forward checkbox.
 
 # Backtest Infrastructure
-- OHLC ingested into Postgres `historical_data` table (timeframe column distinguishes D1 / H4 / H1).
-- **Deep backfill:** `POST /api/historical/deep-backfill` fetches 5000 candles per (symbol, timeframe).
+- OHLC ingested into Postgres `historical_data` table (timeframe column distinguishes D1 / H4 / H1 / M1).
+- **Ingest cadence** (set in `main.py` lifespan):
+  - D1 daily 00:30 UTC+7
+  - H4 every 4h at HH:15
+  - H1 hourly at HH:02
+  - **M1 every 1 minute (interval job, `id="ingest_m1"`) — added 2026-05-26**
+- **Deep backfill caps** (`historical_ingest.INITIAL_BACKFILL`): D1/H4/H1 = 5000 each; M1 = 300000 (~7 months, broker-bounded).
+- **Deep backfill endpoint:** `POST /api/historical/deep-backfill` (per-timeframe cap above).
 - **Multi-symbol backtest:** `POST /api/backtest` with `symbols: list[str]`.
 - **Optimize:** `POST /api/backtest/optimize` — returns `job_id`; poll `GET /api/jobs/{id}`.
   - Parallel via ProcessPoolExecutor (9 workers = 80% of 12 logical cores).

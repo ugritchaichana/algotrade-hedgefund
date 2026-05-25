@@ -14,6 +14,21 @@ _MAX_DESCRIPTION = 4000  # leave headroom under 4096
 _MAX_FIELD_VALUE = 1000  # leave headroom under 1024
 _MAX_CONTENT = 1900       # leave headroom under 2000
 
+# Per-category throttle to protect against scanner bugs that flood the webhook.
+# Each category records the last successful post timestamp; new posts within
+# THROTTLE_SECONDS for the same category are dropped (logged, not raised).
+_last_send_per_category: dict[str, float] = {}
+_THROTTLE_SECONDS = 10.0
+
+
+def _throttle_allowed(category: str) -> bool:
+    now = time.time()
+    last = _last_send_per_category.get(category, 0.0)
+    if now - last < _THROTTLE_SECONDS:
+        return False
+    _last_send_per_category[category] = now
+    return True
+
 
 def _truncate(text: str, limit: int) -> str:
     if text is None:
@@ -49,7 +64,10 @@ def _post_with_retry(payload: dict, attempts: int = 3, base_delay: float = 1.0) 
     return False
 
 
-def send_discord_alert(message: str, embed: dict | None = None) -> bool:
+def send_discord_alert(message: str, embed: dict | None = None, category: str = "default") -> bool:
+    if not _throttle_allowed(category):
+        log.info("Discord throttle: category=%s dropped within %.0fs window", category, _THROTTLE_SECONDS)
+        return False
     data = {
         "content": _truncate(message, _MAX_CONTENT),
         "username": "HedgeFund AI",
@@ -95,7 +113,7 @@ def notify_trade_signal(symbol: str, signal_data: dict) -> bool:
         ],
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
-    return send_discord_alert(f"**{symbol}** setup detected", embed=embed)
+    return send_discord_alert(f"**{symbol}** setup detected", embed=embed, category=f"signal:{symbol}")
 
 
 def notify_safety_event(title: str, detail: str) -> bool:
@@ -106,7 +124,7 @@ def notify_safety_event(title: str, detail: str) -> bool:
         "color": 0xFF8800,
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
-    return send_discord_alert(f"Safety event: **{title}**", embed=embed)
+    return send_discord_alert(f"Safety event: **{title}**", embed=embed, category=f"safety:{title}")
 
 
 def notify_trade_opened(ticket: int, symbol: str, side: str, entry_price: float, sl: float, tp: float, lot: float) -> bool:
@@ -123,7 +141,7 @@ def notify_trade_opened(ticket: int, symbol: str, side: str, entry_price: float,
         ],
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
-    return send_discord_alert(f"🟢 **{symbol}** trade successfully executed", embed=embed)
+    return send_discord_alert(f"🟢 **{symbol}** trade successfully executed", embed=embed, category=f"opened:{symbol}")
 
 
 def notify_trade_closed(ticket: int, symbol: str, side: str, exit_price: float, pnl: float, r_multiple: float, exit_reason: str) -> bool:
@@ -142,7 +160,7 @@ def notify_trade_closed(ticket: int, symbol: str, side: str, exit_price: float, 
         ],
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
-    return send_discord_alert(f"{icon} **{symbol}** trade closed via {exit_reason} (PnL: ${pnl:.2f})", embed=embed)
+    return send_discord_alert(f"{icon} **{symbol}** trade closed via {exit_reason} (PnL: ${pnl:.2f})", embed=embed, category=f"closed:{symbol}")
 
 
 def notify_system_startup(version: str = "v2.1") -> bool:
@@ -152,4 +170,4 @@ def notify_system_startup(version: str = "v2.1") -> bool:
         "color": 0x888888,
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
-    return send_discord_alert("🚀 System online.", embed=embed)
+    return send_discord_alert("🚀 System online.", embed=embed, category="startup")

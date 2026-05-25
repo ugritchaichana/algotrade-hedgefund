@@ -48,6 +48,23 @@ def _manage_one(db, pos) -> None:
     is_buy = pos.type == mt5.ORDER_TYPE_BUY
     current = pos.price_current
 
+    # Capture entry slippage on first encounter (journal.slippage_entry is None until filled).
+    # Slippage = signed pip difference between actual fill (pos.price_open) and requested entry.
+    journal_entry = db.query(TradeJournalEntry).filter(
+        TradeJournalEntry.ticket == pos.ticket,
+        TradeJournalEntry.slippage_entry == None,  # noqa: E711
+    ).first()
+    if journal_entry is not None and journal_entry.entry_price is not None:
+        info = mt5.symbol_info(pos.symbol)
+        point = float(info.point) if info and info.point else 0.00001
+        diff_price = float(pos.price_open) - float(journal_entry.entry_price)
+        if not is_buy:
+            diff_price = -diff_price  # SELL: positive slippage = filled higher = better
+        slippage_pips = round(diff_price / point, 2) if point > 0 else 0.0
+        journal_entry.slippage_entry = slippage_pips
+        log.info("Captured entry slippage: ticket=%s symbol=%s slippage_pips=%.2f",
+                 pos.ticket, pos.symbol, slippage_pips)
+
     # 1) Update max_favorable
     if is_buy:
         new_max = max(state.max_favorable, current)

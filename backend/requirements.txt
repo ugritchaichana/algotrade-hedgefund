@@ -32,6 +32,10 @@ numpy~=2.4.6
 requests~=2.34.2              # MiMo API, Discord webhook, ForexFactory news
 python-dotenv~=1.2.2          # Load backend/.env
 
+# === Testing (dev) ===
+pytest>=8.0                    # backend/tests/ — 5 high-value unit tests
+pytest-asyncio>=0.23           # async test support (FastAPI endpoints, WS)
+
 # === Notes ===
 # - The MetaTrader5 package is Windows-only. Don't install on macOS/Linux.
 # - psycopg2-binary works out-of-the-box on Windows; switch to psycopg2 if compiling from source.

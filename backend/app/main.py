@@ -51,6 +51,7 @@ from app.services.mt5_connector import (
     get_chart_data,
     check_terminal_health,
     get_account_info,
+    ensure_connected,
 )
 from app.services.quant_desk import determine_regime_and_signal, analyze_all_assets
 from app.services.macro_desk import get_morning_briefing, invalidate_briefing_cache
@@ -84,6 +85,12 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# Attach JSON file sink alongside stdout — additive, no migration of existing log calls needed.
+try:
+    from app.core.logging_config import configure_json_logging
+    configure_json_logging()
+except Exception as _log_e:
+    logging.getLogger(__name__).warning("JSON logging init failed: %s", _log_e)
 log = logging.getLogger(__name__)
 
 
@@ -152,10 +159,16 @@ def _safety_gates_pass(sym: str) -> tuple[bool, str]:
     if get_setting("auto_trade_enabled", "true").lower() != "true":
         return False, "kill_switch_off"
 
-    # Gate 2: ping latency
+    # Gate 2: ping latency (with reconnect attempt on disconnect)
     health = check_terminal_health()
     if not health["connected"]:
-        return False, "mt5_disconnected"
+        if not ensure_connected():
+            notify_safety_event("MT5 Reconnect Failed", "Auto-trade halted — could not re-establish MT5 IPC after 3 attempts")
+            return False, "mt5_disconnected"
+        # Re-check after reconnect
+        health = check_terminal_health()
+        if not health["connected"]:
+            return False, "mt5_disconnected"
     if not health["trade_allowed"]:
         return False, "algo_trading_disabled"
     if health["ping_ms"] > 1000:
@@ -217,6 +230,36 @@ def _safety_gates_pass(sym: str) -> tuple[bool, str]:
 # ===== Background tasks =====
 scheduler = AsyncIOScheduler()
 
+# Per-job last-run + last-error tracking — surfaced in /api/health/deep so monitoring can
+# detect silently-stuck scheduled jobs.
+_job_runtime: dict[str, dict] = {}
+
+
+def _tracked(job_id: str):
+    """Decorator factory: wrap a scheduled job target so its last execution timestamp +
+    last error (if any) are recorded for /api/health/deep visibility."""
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            started = datetime.datetime.utcnow().isoformat()
+            try:
+                result = fn(*args, **kwargs)
+                _job_runtime[job_id] = {
+                    "last_run": started,
+                    "last_error": None,
+                    "last_status": "ok",
+                }
+                return result
+            except Exception as e:
+                _job_runtime[job_id] = {
+                    "last_run": started,
+                    "last_error": str(e)[:300],
+                    "last_status": "error",
+                }
+                raise
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return deco
+
 
 async def broadcast_tick_data():
     """Fire every 2s. Pushes prices + orders + account snapshot to all WS clients."""
@@ -236,12 +279,24 @@ async def broadcast_tick_data():
 
 _uvicorn_loop = None
 
+# Graceful shutdown flag — scheduled jobs check this and bail early to avoid leaving
+# half-completed trade state. Set by lifespan exit BEFORE scheduler.shutdown(wait=True).
+_shutting_down: bool = False
+
+
+def is_shutting_down() -> bool:
+    return _shutting_down
+
+
 def background_quant_analysis():
     """Hourly cron. Run trade manager + per-symbol signal + auto-trade pending limit orders."""
     global _last_quant_scan_time
+    if _shutting_down:
+        log.info("quant_scan skipped — shutdown in progress")
+        return
     _last_quant_scan_time = datetime.datetime.utcnow()
     try:
-        # Trade manager — breakeven SL migration
+        # Trade manager — full 4-stage trailing state machine
         try:
             from app.services.trade_manager import manage_active_trades
             manage_active_trades()
@@ -358,6 +413,14 @@ def schedule_h1_ingest():
         log.error("H1 ingest failed: %s", e)
 
 
+def schedule_m1_ingest():
+    try:
+        for sym in get_core_assets():
+            ingest_timeframe(sym, "M1")
+    except Exception as e:
+        log.error("M1 ingest failed: %s", e)
+
+
 # ===== App lifecycle =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -371,16 +434,25 @@ async def lifespan(app: FastAPI):
     notify_system_startup()
 
     from app.services.trade_manager import sync_closed_positions
-    scheduler.add_job(sync_closed_positions, "interval", minutes=5, id="sync_closed_positions")
-    
-    scheduler.add_job(broadcast_tick_data, "interval", seconds=2, id="tick_broadcast")
-    scheduler.add_job(background_quant_analysis, "cron", minute=0, second=5, id="quant_scan")
-    scheduler.add_job(schedule_d1_ingest, "cron", hour=0, minute=30, id="ingest_d1")
-    scheduler.add_job(schedule_h4_ingest, "cron", minute=15, hour="*/4", id="ingest_h4")
-    scheduler.add_job(schedule_h1_ingest, "cron", minute=2, id="ingest_h1")
+    scheduler.add_job(_tracked("sync_closed_positions")(sync_closed_positions), "interval", minutes=5, id="sync_closed_positions")
+
+    scheduler.add_job(_tracked("tick_broadcast")(broadcast_tick_data), "interval", seconds=2, id="tick_broadcast")
+    scheduler.add_job(_tracked("quant_scan")(background_quant_analysis), "cron", minute=0, second=5, id="quant_scan")
+    scheduler.add_job(_tracked("ingest_d1")(schedule_d1_ingest), "cron", hour=0, minute=30, id="ingest_d1")
+    scheduler.add_job(_tracked("ingest_h4")(schedule_h4_ingest), "cron", minute=15, hour="*/4", id="ingest_h4")
+    scheduler.add_job(_tracked("ingest_h1")(schedule_h1_ingest), "cron", minute=2, id="ingest_h1")
+    scheduler.add_job(
+        _tracked("ingest_m1")(schedule_m1_ingest),
+        "interval",
+        minutes=1,
+        id="ingest_m1",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
     from app.services.equity_recorder import capture_snapshot
     scheduler.add_job(
-        capture_snapshot,
+        _tracked("equity_snapshot")(capture_snapshot),
         'cron',
         hour='0,4,8,12,16,20',
         minute=2,
@@ -395,12 +467,26 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(schedule_d1_ingest, id="startup_d1")
     scheduler.add_job(schedule_h4_ingest, id="startup_h4")
     scheduler.add_job(schedule_h1_ingest, id="startup_h1")
+    scheduler.add_job(schedule_m1_ingest, id="startup_m1")
 
     yield
 
-    log.info("Shutting down")
-    scheduler.shutdown()
+    global _shutting_down
+    log.info("Shutting down — graceful drain begin")
+    _shutting_down = True
+    # Wait briefly so in-flight scheduled jobs that just checked the flag can exit cleanly.
+    # 3s covers fast paths (broadcast_tick, equity_snapshot). Long-running jobs (M1 ingest
+    # during deep backfill) won't complete here — that's accepted; partial ingest is idempotent.
+    try:
+        await asyncio.sleep(3.0)
+    except Exception:
+        pass
+    try:
+        scheduler.shutdown(wait=True)
+    except Exception as e:
+        log.error("scheduler.shutdown failed: %s", e)
     shutdown_mt5()
+    log.info("Shutdown complete")
 
 
 async def _safe_call(coro_fn, label: str):
@@ -446,11 +532,51 @@ async def pin_auth_middleware(request: Request, call_next):
 class PinRequest(BaseModel):
     pin: str
 
+
+# PIN brute-force protection — track failed attempts per client IP with sliding window.
+# Allows 5 failures per 60s window before blocking. Records cleared on successful login.
+_pin_failures: dict[str, list[float]] = {}
+_PIN_FAIL_LIMIT = 5
+_PIN_FAIL_WINDOW_SECONDS = 60.0
+_PIN_BLOCK_SECONDS = 300.0  # 5min block after limit hit
+
+
+def _pin_attempt_allowed(client_ip: str) -> tuple[bool, str]:
+    import time as _time
+    now = _time.time()
+    failures = _pin_failures.get(client_ip, [])
+    # Drop entries outside the window
+    failures = [t for t in failures if now - t < _PIN_FAIL_WINDOW_SECONDS]
+    _pin_failures[client_ip] = failures
+    if len(failures) >= _PIN_FAIL_LIMIT:
+        # Block if the most recent failure is within the block window
+        if failures and (now - failures[-1]) < _PIN_BLOCK_SECONDS:
+            return False, f"rate_limited (until {int(_PIN_BLOCK_SECONDS - (now - failures[-1]))}s)"
+        _pin_failures[client_ip] = []
+    return True, "ok"
+
+
+def _pin_record_failure(client_ip: str) -> None:
+    import time as _time
+    _pin_failures.setdefault(client_ip, []).append(_time.time())
+
+
+def _pin_clear_failures(client_ip: str) -> None:
+    _pin_failures.pop(client_ip, None)
+
+
 @app.post("/api/auth/pin")
-def verify_pin(payload: PinRequest):
+def verify_pin(payload: PinRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    allowed, reason = _pin_attempt_allowed(client_ip)
+    if not allowed:
+        log.warning(f"PIN attempt blocked: ip={client_ip} reason={reason}")
+        return JSONResponse(status_code=429, content={"ok": False, "error": f"Too many failed attempts. {reason}"})
     correct_pin = get_setting("access_pin", "130944")
     if payload.pin == correct_pin:
+        _pin_clear_failures(client_ip)
         return {"ok": True}
+    _pin_record_failure(client_ip)
     return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid PIN"})
 
 app.include_router(ws_router, prefix="/api")
@@ -498,6 +624,17 @@ class OptimizeRequest(BaseModel):
     walk_forward: bool = False       # split date range into train + test, validate OOS
     train_ratio: float = 0.67        # fraction of window used for training (0.4-0.9)
 
+    def model_post_init(self, __context) -> None:
+        """Reject TP sweeps. Run 2 (2026-05-24) proved TP is decorative — exits always
+        fire via partial close or trail before TP binds. Sweeping it just wastes 4x compute.
+        Pin TP via the `fixed` dict instead."""
+        if isinstance(self.sweeps, dict) and "tp_atr_mult" in self.sweeps:
+            raise ValueError(
+                "tp_atr_mult sweep is rejected: TP is decorative in this strategy "
+                "(Run 2 finding 2026-05-24 — trailing/partial-close always exits first). "
+                "Pin TP via the `fixed` dict, e.g. fixed={'tp_atr_mult': 4.0}."
+            )
+
 
 
 
@@ -532,16 +669,19 @@ def health_deep():
 
     mt5_health = check_terminal_health()
 
-    # Scheduler jobs
+    # Scheduler jobs with last_run + last_error from _job_runtime
     jobs = []
     sched = globals().get("scheduler")
     if sched:
         try:
             for j in sched.get_jobs():
+                runtime = _job_runtime.get(j.id, {})
                 jobs.append({
                     "id": j.id,
                     "next_run": j.next_run_time.isoformat() if j.next_run_time else None,
-                    "last_run": None,
+                    "last_run": runtime.get("last_run"),
+                    "last_status": runtime.get("last_status"),
+                    "last_error": runtime.get("last_error"),
                 })
         except Exception:
             pass

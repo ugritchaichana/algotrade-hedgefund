@@ -32,6 +32,30 @@ def shutdown_mt5() -> None:
     mt5.shutdown()
 
 
+def ensure_connected(max_attempts: int = 3, base_delay: float = 1.0) -> bool:
+    """Verify MT5 IPC is up; on failure, attempt re-init with exponential backoff.
+
+    Returns True if connected (or successfully reconnected). False if all attempts failed.
+    Use before any critical MT5 call where a transient disconnect would silently drop data.
+    """
+    if mt5.terminal_info() is not None:
+        return True
+    for attempt in range(max_attempts):
+        delay = base_delay * (2 ** attempt)
+        log.warning("MT5 disconnected — reconnect attempt %d/%d (delay %.1fs)",
+                    attempt + 1, max_attempts, delay)
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(delay)
+        if init_mt5() and mt5.terminal_info() is not None:
+            log.info("MT5 reconnected on attempt %d", attempt + 1)
+            return True
+    log.error("MT5 reconnect failed after %d attempts", max_attempts)
+    return False
+
+
 def resolve_symbol(symbol: str) -> str:
     """Resolve a logical symbol to its broker-specific name. Handles IUX-style aliases."""
     aliases = {
