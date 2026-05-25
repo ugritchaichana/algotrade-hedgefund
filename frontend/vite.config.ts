@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+// Backend API target — overridable via VITE_API_PROXY for non-standard setups.
+const API_TARGET = process.env.VITE_API_PROXY || 'http://127.0.0.1:8000'
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
@@ -23,5 +26,19 @@ export default defineConfig({
       '.ts.net',
       '.local',
     ],
+    // Proxy /api and /api/ws to backend so single tunnel (Cloudflare/Tailscale) works.
+    // Without this, browser hits Vite (port 5173) for /api/* → Vite returns 404.
+    // With this, Vite forwards to backend (port 8000) preserving cookies + PIN headers.
+    proxy: {
+      '/api/ws': {
+        target: API_TARGET,
+        changeOrigin: true,
+        ws: true,  // upgrade HTTP → WebSocket
+      },
+      '/api': {
+        target: API_TARGET,
+        changeOrigin: true,
+      },
+    },
   },
 })

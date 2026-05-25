@@ -1,15 +1,33 @@
 /**
  * Centralized API base URL + helpers.
  *
- * Env var: VITE_API_URL (set in .env.local or .env)
- * Default: http://127.0.0.1:8000 (local dev)
+ * Resolution order:
+ *   1. VITE_API_URL env var — explicit override (e.g. VITE_API_URL=http://192.168.1.42:8000)
+ *   2. Cloudflare tunnel / HTTPS remote — empty string (relative URLs → Vite proxy forwards)
+ *   3. Local Vite dev (port 5173 on localhost) — absolute http://127.0.0.1:8000
+ *   4. Anything else — empty (same-origin)
  *
- * For LAN remote access, set VITE_API_URL to backend's LAN IP:
- *   VITE_API_URL=http://192.168.1.42:8000
- *
- * For future Tailscale: VITE_API_URL=http://booth-pc.tailnet:8000
+ * The relative-URL branch is what makes the Cloudflare quick tunnel
+ * (`cloudflared tunnel --url http://localhost:5173`) work without leaking backend port.
+ * Vite proxy in vite.config.ts forwards /api + /api/ws to the backend.
  */
-export const API_BASE = (import.meta.env.VITE_API_URL as string) || (typeof window !== 'undefined' && window.location.port === '5173' ? 'http://127.0.0.1:8000' : '');
+function resolveApiBase(): string {
+  const envVar = import.meta.env.VITE_API_URL as string | undefined;
+  if (envVar) return envVar;
+  if (typeof window === 'undefined') return '';
+  const loc = window.location;
+  // Remote access via HTTPS (Cloudflare tunnel, Tailscale Funnel, etc.) → relative
+  if (loc.protocol === 'https:') return '';
+  // Local Vite dev on default port → backend on 8000
+  if (loc.port === '5173' && (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1')) {
+    return 'http://127.0.0.1:8000';
+  }
+  // LAN access via http://<LAN-IP>:5173 → same hostname, port 8000
+  if (loc.port === '5173') return `http://${loc.hostname}:8000`;
+  return '';
+}
+
+export const API_BASE = resolveApiBase();
 
 export function getPin() {
   return localStorage.getItem('algo_pin') || '';
