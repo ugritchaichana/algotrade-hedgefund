@@ -13,6 +13,7 @@ Safety gates enforced here:
 """
 
 import time
+import datetime
 import logging
 import MetaTrader5 as mt5
 from app.core.database import log_action
@@ -112,7 +113,16 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
 
     profile = ASSET_PROFILES.get(symbol, {})
 
-    # Gate 1: spread protection
+    # Gate 1a: trade_mode check — symbol must be enabled for full trade (not close-only/disabled)
+    TRADE_MODE_FULL = 4  # MT5 constant: full trading allowed
+    if hasattr(info, "trade_mode") and info.trade_mode is not None and info.trade_mode != TRADE_MODE_FULL:
+        detail = f"{symbol} trade_mode={info.trade_mode} (not FULL=4) — order skipped"
+        log.warning(detail)
+        log_action("Execution Desk", "Trade Mode Block", detail)
+        notify_safety_event("Symbol Trade Mode", detail)
+        return {"success": False, "ticket": None, "error": detail, "reason": "trade_mode_disabled"}
+
+    # Gate 1b: spread protection
     max_spread = profile.get("max_spread", 50)
     if info.spread > max_spread:
         detail = f"{symbol} spread={info.spread} > max={max_spread} — order aborted to prevent slippage"
@@ -121,10 +131,52 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
         notify_safety_event("Spread Protection", detail)
         return {"success": False, "ticket": None, "error": detail, "reason": "spread"}
 
-    # Gate 2: swap warning (non-blocking, just alerts)
+    # Gate 1c: stops_level check — broker minimum SL distance (in points)
+    # If SL is closer than this, broker rejects with "invalid stops" — pre-empt.
+    stops_level = getattr(info, "trade_stops_level", 0) or 0
+    if stops_level > 0 and info.point and info.point > 0:
+        min_distance_price = stops_level * info.point
+        sl_distance = abs(entry - sl)
+        if sl_distance < min_distance_price:
+            detail = (f"{symbol} SL distance {sl_distance:.5f} < broker minimum {min_distance_price:.5f} "
+                      f"(stops_level={stops_level} points). Order will be rejected — aborting pre-emptively.")
+            log.warning(detail)
+            log_action("Execution Desk", "Stops Level Block", detail)
+            return {"success": False, "ticket": None, "error": detail, "reason": "stops_level_violation"}
+
+    # Gate 1d: lot constraints — clamp + round to broker's volume_step
+    if info.volume_step and info.volume_step > 0:
+        # Round to nearest step
+        steps = round(lot / info.volume_step)
+        lot = round(steps * info.volume_step, 4)
+    if info.volume_min and lot < info.volume_min:
+        detail = f"{symbol} requested lot {lot} < broker minimum {info.volume_min} — bumping to min"
+        log.info(detail)
+        lot = float(info.volume_min)
+    if info.volume_max and lot > info.volume_max:
+        lot = float(info.volume_max)
+
+    # Gate 1e: margin pre-check — account must have free margin for this order
+    if info.margin_initial and info.margin_initial > 0:
+        required_margin = float(info.margin_initial) * lot
+        account = mt5.account_info()
+        if account and account.margin_free is not None:
+            if account.margin_free < required_margin * 1.2:  # 20% headroom
+                detail = (f"{symbol} insufficient free margin: have {account.margin_free:.2f}, "
+                          f"need ~{required_margin * 1.2:.2f} (with 20% headroom)")
+                log.warning(detail)
+                log_action("Execution Desk", "Margin Insufficient", detail)
+                notify_safety_event("Margin Insufficient", detail)
+                return {"success": False, "ticket": None, "error": detail, "reason": "margin_insufficient"}
+
+    # Gate 2: swap warning (non-blocking) — account for triple-swap day from broker info
     swap_cost = info.swap_long if "BUY" in signal else info.swap_short
-    if swap_cost < -50:
-        warn = f"{symbol} negative swap detected ({swap_cost}). Swing trade will incur high holding cost."
+    triple_day = getattr(info, "swap_rollover3days", 5) or 5  # Friday=5 is fallback
+    today_dow = datetime.datetime.utcnow().isoweekday()  # 1=Mon..7=Sun
+    swap_today = swap_cost * (3 if today_dow == triple_day else 1)
+    if swap_today < -50:
+        warn = (f"{symbol} negative swap today: {swap_today} (base={swap_cost}, "
+                f"triple_day={triple_day}). Swing trade will incur high holding cost.")
         log.warning(warn)
         log_action("Execution Desk", "Swap Warning", warn)
         notify_safety_event("High Swap Cost", warn)
@@ -174,10 +226,23 @@ def execute_trade(symbol: str, signal_data: dict) -> dict:
         tp=tp,
         lot=lot
     )
+    try:
+        from app.core.events import broadcast_event
+        broadcast_event("TRADE_OPENED", {
+            "ticket": int(result.order),
+            "symbol": symbol,
+            "side": "BUY" if "BUY" in signal else "SELL",
+            "entry_price": entry,
+            "sl": sl,
+            "tp": tp,
+            "lot": lot,
+            "signal": signal,
+        })
+    except Exception:
+        pass
 
     # Write initial TradeJournalEntry
     import json
-    import datetime
     from app.core.database import SessionLocal, TradeJournalEntry
     db = SessionLocal()
     try:

@@ -4,18 +4,21 @@ export default {
     "./index.html",
     "./src/**/*.{js,ts,jsx,tsx}",
   ],
+  // Use class-based dark mode toggle (data-theme attribute on <html>)
+  darkMode: ['class', '[data-theme="dark"]'],
   theme: {
     extend: {
       colors: {
-        background: '#0a0a0a',
-        surface: '#171717',
-        surfaceLight: '#262626',
-        primary: '#3b82f6',
-        success: '#22c55e',
-        danger: '#ef4444',
-        warning: '#f59e0b',
-        text: '#f5f5f5',
-        textMuted: '#a3a3a3',
+        // CSS variable driven — flip palette via data-theme="light" / "dark"
+        background: 'rgb(var(--c-background) / <alpha-value>)',
+        surface: 'rgb(var(--c-surface) / <alpha-value>)',
+        surfaceLight: 'rgb(var(--c-surfaceLight) / <alpha-value>)',
+        primary: 'rgb(var(--c-primary) / <alpha-value>)',
+        success: 'rgb(var(--c-success) / <alpha-value>)',
+        danger: 'rgb(var(--c-danger) / <alpha-value>)',
+        warning: 'rgb(var(--c-warning) / <alpha-value>)',
+        text: 'rgb(var(--c-text) / <alpha-value>)',
+        textMuted: 'rgb(var(--c-textMuted) / <alpha-value>)',
       }
     },
   },

@@ -1,10 +1,23 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { ChevronDown, ChevronRight, Download, Filter } from 'lucide-react';
+import { ChevronDown, ChevronRight, Download, Filter, Target, AlertTriangle } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { API_BASE } from '../lib/api';
 import type { TradeJournalEntry } from '../lib/types';
 
+interface Attribution {
+  window_days: number;
+  overall: { count: number; win_rate: number; avg_r: number; total_pnl: number; profit_factor: number | null };
+  edge: { count: number; win_rate: number; avg_r: number; total_pnl: number; profit_factor: number | null };
+  noise: { count: number; win_rate: number; avg_r: number; total_pnl: number; profit_factor: number | null };
+  mixed: { count: number; win_rate: number; avg_r: number; total_pnl: number; profit_factor: number | null };
+  r_distribution: Record<string, number>;
+  by_exit_reason: Record<string, any>;
+  by_symbol: Record<string, any>;
+}
+
 const TradeJournal = () => {
   const [rows, setRows] = useState<TradeJournalEntry[]>([]);
+  const [attribution, setAttribution] = useState<Attribution | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -19,7 +32,11 @@ const TradeJournal = () => {
       setLoading(true);
       setError(null);
       try {
-        const r = await fetch(`${API_BASE}/api/journal?days=${days}`);
+        // Parallel: journal + attribution
+        const [r, ar] = await Promise.all([
+          fetch(`${API_BASE}/api/journal?days=${days}`),
+          fetch(`${API_BASE}/api/journal/attribution?days=${days}`),
+        ]);
         if (!r.ok) {
           if (r.status === 404) {
             setRows([]);
@@ -31,6 +48,10 @@ const TradeJournal = () => {
         const data = await r.json();
         if (!cancel) {
           setRows(data.rows || []);
+          if (ar.ok) {
+            const adata = await ar.json();
+            setAttribution(adata);
+          }
         }
       } catch (e: any) {
         if (!cancel) setError(e?.message || 'Failed to load journal');
@@ -173,6 +194,83 @@ const TradeJournal = () => {
           </div>
         </div>
       </div>
+
+      {/* Attribution (Edge vs Noise) + R-distribution — Phase 2 decision tools */}
+      {attribution && attribution.overall.count > 0 && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Edge vs Noise breakdown */}
+          <div className="bg-surface border border-surfaceLight rounded-lg p-4 lg:col-span-1">
+            <div className="flex items-center gap-2 mb-3">
+              <Target size={16} className="text-primary" />
+              <h3 className="font-semibold text-sm">Edge vs Noise</h3>
+            </div>
+            <p className="text-xs text-textMuted mb-3">
+              Edge = thesis trades (partial close, TP, trail ≥1.5R). Noise = stopped before trail.
+            </p>
+            <div className="space-y-2">
+              <div className="border-l-4 border-success pl-3 py-2 bg-success/5 rounded">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-semibold text-success">Edge</span>
+                  <span className="text-xs text-textMuted">{attribution.edge.count} trades</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-1 text-xs">
+                  <div><span className="text-textMuted">WR</span> <span className="font-mono font-semibold">{attribution.edge.win_rate}%</span></div>
+                  <div><span className="text-textMuted">PF</span> <span className="font-mono font-semibold">{attribution.edge.profit_factor ?? '∞'}</span></div>
+                  <div><span className="text-textMuted">avg R</span> <span className="font-mono font-semibold">{attribution.edge.avg_r}</span></div>
+                </div>
+                <div className="text-xs text-textMuted mt-1">P/L: <span className={`font-mono ${attribution.edge.total_pnl >= 0 ? 'text-success' : 'text-danger'}`}>${attribution.edge.total_pnl}</span></div>
+              </div>
+              <div className="border-l-4 border-danger pl-3 py-2 bg-danger/5 rounded">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-semibold text-danger">Noise</span>
+                  <span className="text-xs text-textMuted">{attribution.noise.count} trades</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-1 text-xs">
+                  <div><span className="text-textMuted">WR</span> <span className="font-mono font-semibold">{attribution.noise.win_rate}%</span></div>
+                  <div><span className="text-textMuted">PF</span> <span className="font-mono font-semibold">{attribution.noise.profit_factor ?? '0'}</span></div>
+                  <div><span className="text-textMuted">avg R</span> <span className="font-mono font-semibold">{attribution.noise.avg_r}</span></div>
+                </div>
+                <div className="text-xs text-textMuted mt-1">P/L: <span className={`font-mono ${attribution.noise.total_pnl >= 0 ? 'text-success' : 'text-danger'}`}>${attribution.noise.total_pnl}</span></div>
+              </div>
+              <div className="border-l-4 border-textMuted pl-3 py-2 bg-surfaceLight/30 rounded">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-semibold text-textMuted">Mixed</span>
+                  <span className="text-xs text-textMuted">{attribution.mixed.count} trades</span>
+                </div>
+                <div className="text-xs text-textMuted mt-1">P/L: <span className="font-mono">${attribution.mixed.total_pnl}</span></div>
+              </div>
+            </div>
+          </div>
+
+          {/* R-distribution histogram */}
+          <div className="bg-surface border border-surfaceLight rounded-lg p-4 lg:col-span-2">
+            <div className="flex items-center gap-2 mb-3">
+              <AlertTriangle size={16} className="text-warning" />
+              <h3 className="font-semibold text-sm">R-multiple Distribution</h3>
+            </div>
+            <p className="text-xs text-textMuted mb-3">
+              Where trades exited relative to risk. Healthy: skewed right (1.5R+ has frequency, &lt;-1R is small).
+            </p>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={Object.entries(attribution.r_distribution).map(([range, count]) => ({ range, count }))}>
+                <XAxis dataKey="range" stroke="rgb(var(--c-textMuted))" tick={{ fontSize: 11 }} />
+                <YAxis stroke="rgb(var(--c-textMuted))" tick={{ fontSize: 11 }} />
+                <Tooltip
+                  contentStyle={{ background: 'rgb(var(--c-surface))', border: '1px solid rgb(var(--c-surfaceLight))', borderRadius: 6 }}
+                  labelStyle={{ color: 'rgb(var(--c-text))' }}
+                />
+                <Bar dataKey="count">
+                  {Object.keys(attribution.r_distribution).map((range, idx) => {
+                    const isNeg = range.startsWith('<') || range.startsWith('-');
+                    const isPos = range.startsWith('1.5') || range.startsWith('2') || range.startsWith('>=');
+                    return <Cell key={idx} fill={isNeg ? 'rgb(var(--c-danger))' : isPos ? 'rgb(var(--c-success))' : 'rgb(var(--c-textMuted))'} />;
+                  })}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
 
       {/* Filters */}
       <div className="bg-surface border border-surfaceLight rounded-lg p-4 flex items-center gap-3 flex-wrap">

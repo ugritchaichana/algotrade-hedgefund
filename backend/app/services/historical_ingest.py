@@ -87,6 +87,10 @@ def ingest_timeframe(symbol: str, tf_str: str) -> dict:
                 "inserted": 0, "fetched": 0, "reason": "no_data",
             }
 
+        # MT5 copy_rates returns numpy structured array; field names available via dtype.names
+        rate_fields = set(rates.dtype.names or ()) if hasattr(rates, "dtype") else set()
+        has_spread = "spread" in rate_fields
+        has_real_volume = "real_volume" in rate_fields
         rows = [
             {
                 "symbol": symbol,
@@ -97,6 +101,8 @@ def ingest_timeframe(symbol: str, tf_str: str) -> dict:
                 "low_price": float(r["low"]),
                 "close_price": float(r["close"]),
                 "tick_volume": int(r["tick_volume"]),
+                "spread": int(r["spread"]) if has_spread else None,
+                "real_volume": int(r["real_volume"]) if has_real_volume else None,
             }
             for r in rates
         ]
@@ -106,9 +112,22 @@ def ingest_timeframe(symbol: str, tf_str: str) -> dict:
         result = db.execute(stmt)
         db.commit()
 
+        inserted = result.rowcount or 0
+        if inserted > 0:
+            try:
+                from app.core.events import broadcast_event
+                broadcast_event("INGEST_TICK", {
+                    "symbol": symbol,
+                    "timeframe": tf_str,
+                    "inserted": inserted,
+                    "latest_time": rows[-1]["time"].isoformat() if rows else None,
+                }, throttle_key=f"ingest:{tf_str}")
+            except Exception:
+                pass
+
         return {
             "ok": True, "symbol": symbol, "timeframe": tf_str,
-            "fetched": len(rows), "inserted": result.rowcount or 0,
+            "fetched": len(rows), "inserted": inserted,
         }
     except Exception as e:
         db.rollback()
@@ -156,6 +175,10 @@ def deep_backfill_timeframe(symbol: str, tf_str: str, count: int | None = None) 
         if rates is None or len(rates) == 0:
             return {"ok": True, "symbol": symbol, "timeframe": tf_str, "fetched": 0, "inserted": 0, "reason": "broker_returned_empty"}
 
+        # MT5 copy_rates returns numpy structured array; field names available via dtype.names
+        rate_fields = set(rates.dtype.names or ()) if hasattr(rates, "dtype") else set()
+        has_spread = "spread" in rate_fields
+        has_real_volume = "real_volume" in rate_fields
         rows = [
             {
                 "symbol": symbol,
@@ -166,6 +189,8 @@ def deep_backfill_timeframe(symbol: str, tf_str: str, count: int | None = None) 
                 "low_price": float(r["low"]),
                 "close_price": float(r["close"]),
                 "tick_volume": int(r["tick_volume"]),
+                "spread": int(r["spread"]) if has_spread else None,
+                "real_volume": int(r["real_volume"]) if has_real_volume else None,
             }
             for r in rates
         ]

@@ -124,6 +124,12 @@ def notify_safety_event(title: str, detail: str) -> bool:
         "color": 0xFF8800,
         "footer": {"text": "AlgoTrade HedgeFund System"},
     }
+    # Also push to frontend via WS (toast in header)
+    try:
+        from app.core.events import broadcast_event
+        broadcast_event("SAFETY_EVENT", {"title": title, "detail": detail})
+    except Exception:
+        pass
     return send_discord_alert(f"Safety event: **{title}**", embed=embed, category=f"safety:{title}")
 
 

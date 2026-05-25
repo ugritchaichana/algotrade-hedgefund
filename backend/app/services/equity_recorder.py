@@ -40,6 +40,19 @@ def capture_snapshot() -> bool:
         db.commit()
         log.info("equity_snapshot: equity=%.2f balance=%.2f open=%d daily_pnl=%.2f",
                  info.equity, info.balance, len(positions), daily_pnl)
+        try:
+            from app.core.events import broadcast_event
+            broadcast_event("EQUITY_SNAPSHOT", {
+                "recorded_at": snap.recorded_at.isoformat() if snap.recorded_at else None,
+                "equity": float(info.equity),
+                "balance": float(info.balance),
+                "free_margin": float(info.margin_free),
+                "open_positions": len(positions),
+                "daily_pnl": round(daily_pnl, 2),
+                "floating_pnl": round(floating, 2),
+            })
+        except Exception:
+            pass
         return True
     except Exception as e:
         log.exception("equity_snapshot failed: %s", e)

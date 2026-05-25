@@ -123,6 +123,7 @@ def _manage_one(db, pos) -> None:
         new_sl = max(new_sl, trail) if is_buy else min(new_sl, trail)
 
     # Commit changes
+    old_stage = state.trail_stage
     if new_stage != state.trail_stage:
         state.trail_stage = new_stage
     if abs(new_sl - state.sl) > 1e-6:
@@ -134,6 +135,21 @@ def _manage_one(db, pos) -> None:
 
     state.trailing_active = state.trail_stage >= 1
     db.commit()
+
+    # Broadcast state transition
+    if new_stage != old_stage:
+        try:
+            from app.core.events import broadcast_event
+            broadcast_event("TRADE_STATE_CHANGE", {
+                "ticket": pos.ticket,
+                "symbol": pos.symbol,
+                "old_stage": old_stage,
+                "new_stage": new_stage,
+                "new_sl": state.sl,
+                "r_multiple": round(r, 3),
+            })
+        except Exception:
+            pass
 
 
 def _close_journal_entry(db, ticket, exit_price, exit_reason, r_multiple, pnl, slippage_exit):
@@ -210,7 +226,7 @@ def _process_closed_trade(db, trade):
             r_multiple = (trade.entry_price - exit_price) / state.initial_sl_distance
             
     _close_journal_entry(db, trade.ticket, exit_price, reason, r_multiple, total_pnl, 0.0)
-    
+
     notify_trade_closed(
         ticket=trade.ticket,
         symbol=trade.symbol,
@@ -220,4 +236,17 @@ def _process_closed_trade(db, trade):
         r_multiple=r_multiple,
         exit_reason=reason
     )
+    try:
+        from app.core.events import broadcast_event
+        broadcast_event("TRADE_CLOSED", {
+            "ticket": trade.ticket,
+            "symbol": trade.symbol,
+            "side": trade.side,
+            "exit_price": float(exit_price),
+            "pnl": round(float(total_pnl), 2),
+            "r_multiple": round(float(r_multiple), 3),
+            "exit_reason": reason,
+        })
+    except Exception:
+        pass
     log.info("Synced closed position %s: PnL=%.2f R=%.2f", trade.ticket, total_pnl, r_multiple)

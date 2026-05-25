@@ -28,7 +28,15 @@ def test_idempotency_blocks_duplicate_send(monkeypatch):
         spread = 5
         swap_long = -1.0
         swap_short = -1.0
+        swap_rollover3days = 5
         digits = 5
+        trade_mode = 4  # FULL
+        trade_stops_level = 0
+        volume_step = 0.01
+        volume_min = 0.01
+        volume_max = 100.0
+        margin_initial = 0.0
+        point = 0.00001
 
     class FakeResult:
         retcode = mt5_stub.TRADE_RETCODE_DONE

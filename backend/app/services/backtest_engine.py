@@ -72,6 +72,8 @@ def _load_ohlc(symbol: str, timeframe: str, start: datetime.datetime, end: datet
                     "low": r.low_price,
                     "close": r.close_price,
                     "tick_volume": r.tick_volume,
+                    "spread": r.spread,         # may be None for pre-2026-05-26 rows
+                    "real_volume": r.real_volume,
                 }
                 for r in rows
             ]
@@ -162,17 +164,29 @@ def _gross_pnl(direction: str, entry: float, exit_price: float, lot: float, meta
     return delta * point_value * lot
 
 
-def _cost(spread_pips: float, slippage_pips: float, lot: float, meta: dict) -> float:
+def _cost(spread_pips: float, slippage_pips: float, lot: float, meta: dict,
+          actual_spread_points: float | None = None) -> float:
     """Round-trip cost in account currency = (spread + slippage) pips × pip_value × lot.
 
     pip_value = pip_size × point_value where point_value = tick_value / tick_size.
     For EURUSD 5-digit: pip_size=0.0001, point_value=$100,000 → pip_value=$10/lot.
     For XAUUSD 2-digit: pip_size=0.10,   point_value=$100     → pip_value=$10/lot.
+
+    If `actual_spread_points` provided (from per-candle MT5 data), it overrides the flat
+    `spread_pips` parameter — gives realistic backtest with spread variance across time.
+    Falls back to `spread_pips` when None (legacy data without spread column).
     """
     if not meta["tick_size"]:
         return 0.0
     point_value = meta["tick_value"] / meta["tick_size"]
     pip_value = meta["pip_size"] * point_value
+    if actual_spread_points is not None and meta.get("point") and meta.get("pip_size"):
+        # Convert MT5 spread (in points) to pips. points_per_pip = pip_size / point.
+        points_per_pip = meta["pip_size"] / meta["point"]
+        effective_spread_pips = float(actual_spread_points) / points_per_pip if points_per_pip > 0 else spread_pips
+        # Slippage model: 30% of spread (empirical CFD retail rule)
+        effective_slippage_pips = 0.3 * effective_spread_pips
+        return (effective_spread_pips + effective_slippage_pips) * pip_value * lot
     return (spread_pips + slippage_pips) * pip_value * lot
 
 
@@ -263,11 +277,30 @@ def run_backtest(
 
     sma_warmup = max(p["sma_fast_period"], p["sma_slow_period"])
 
-    def _close_position(pos: dict, exit_price: float, exit_time, reason: str, lot: float) -> float:
-        """Record a closing trade. Returns realized P/L (gross - cost)."""
+    def _bar_spread(bar) -> float | None:
+        """Pull MT5 spread (in points) from a pandas Series row. None when column absent
+        or value missing — caller falls back to flat spread_pips parameter."""
+        try:
+            if "spread" not in bar.index:
+                return None
+            v = bar["spread"]
+            if v is None or pd.isna(v):
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _close_position(pos: dict, exit_price: float, exit_time, reason: str, lot: float,
+                        actual_spread: float | None = None) -> float:
+        """Record a closing trade. Returns realized P/L (gross - cost).
+
+        actual_spread: per-candle spread in MT5 points at the exit bar. When provided,
+        backtest cost reflects spread variance (NFP spike, weekend gap) instead of flat
+        spread_pips parameter. Backward-compatible: NULL/missing → falls back to flat.
+        """
         nonlocal equity
         gross = _gross_pnl(pos["type"], pos["entry"], exit_price, lot, meta)
-        cost = _cost(spread_pips, slippage_pips, lot, meta)
+        cost = _cost(spread_pips, slippage_pips, lot, meta, actual_spread_points=actual_spread)
         pnl = gross - cost
         equity += pnl
         trades.append({
@@ -309,7 +342,8 @@ def run_backtest(
             close_price = pos["entry"] + 1.5 * pos["initial_sl_distance"] if is_buy else pos["entry"] - 1.5 * pos["initial_sl_distance"]
             partial_lot = round(pos["current_lot"] / 2, 2)
             if partial_lot > 0:
-                _close_position(pos, close_price, next_bar["time"], "PARTIAL_TP", partial_lot)
+                _close_position(pos, close_price, next_bar["time"], "PARTIAL_TP", partial_lot,
+                                actual_spread=_bar_spread(next_bar))
                 pos["current_lot"] = round(pos["current_lot"] - partial_lot, 2)
             lock_price = pos["entry"] + 0.5 * pos["initial_sl_distance"] if is_buy else pos["entry"] - 0.5 * pos["initial_sl_distance"]
             pos["sl"] = max(pos["sl"], lock_price) if is_buy else min(pos["sl"], lock_price)
@@ -354,21 +388,22 @@ def run_backtest(
             _advance_trailing(active, next_bar)
 
             # 2. Check SL/TP hit
+            bar_spread = _bar_spread(next_bar)
             if active["type"] == "BUY":
                 if next_bar["low"] <= active["sl"]:
                     exit_price = active["sl"] - slippage_pips * meta["pip_size"]
-                    _close_position(active, exit_price, next_bar["time"], "TRAIL_SL" if active["trail_stage"] >= 1 else "SL", active["current_lot"])
+                    _close_position(active, exit_price, next_bar["time"], "TRAIL_SL" if active["trail_stage"] >= 1 else "SL", active["current_lot"], actual_spread=bar_spread)
                     active = None
                 elif next_bar["high"] >= active["tp"]:
-                    _close_position(active, active["tp"], next_bar["time"], "TP", active["current_lot"])
+                    _close_position(active, active["tp"], next_bar["time"], "TP", active["current_lot"], actual_spread=bar_spread)
                     active = None
             else:
                 if next_bar["high"] >= active["sl"]:
                     exit_price = active["sl"] + slippage_pips * meta["pip_size"]
-                    _close_position(active, exit_price, next_bar["time"], "TRAIL_SL" if active["trail_stage"] >= 1 else "SL", active["current_lot"])
+                    _close_position(active, exit_price, next_bar["time"], "TRAIL_SL" if active["trail_stage"] >= 1 else "SL", active["current_lot"], actual_spread=bar_spread)
                     active = None
                 elif next_bar["low"] <= active["tp"]:
-                    _close_position(active, active["tp"], next_bar["time"], "TP", active["current_lot"])
+                    _close_position(active, active["tp"], next_bar["time"], "TP", active["current_lot"], actual_spread=bar_spread)
                     active = None
 
         # Fill pending

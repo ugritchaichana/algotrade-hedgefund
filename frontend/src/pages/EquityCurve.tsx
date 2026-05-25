@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { createChart, AreaSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi } from 'lightweight-charts';
 import { TrendingUp, TrendingDown, Activity, AlertTriangle } from 'lucide-react';
+import { ComposedChart, Area, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Cell } from 'recharts';
 import { API_BASE } from '../lib/api';
 import type { EquitySnapshot } from '../lib/types';
 
@@ -102,6 +103,22 @@ const EquityCurve = () => {
   const dd = stats?.current_dd_pct ?? 0;
   const ret = stats?.total_return_pct ?? 0;
 
+  // Compute drawdown series + daily P/L bars for Recharts overlay
+  const ddSeries = useMemo(() => {
+    if (snapshots.length === 0) return [];
+    let peak = snapshots[0].equity;
+    return snapshots.map((s) => {
+      peak = Math.max(peak, s.equity);
+      const dd_pct = peak > 0 ? ((s.equity - peak) / peak) * 100 : 0;
+      return {
+        time: new Date(s.recorded_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit' }),
+        equity: s.equity,
+        drawdown: dd_pct,
+        daily_pnl: s.daily_pnl,
+      };
+    });
+  }, [snapshots]);
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
@@ -189,6 +206,31 @@ const EquityCurve = () => {
           <div ref={chartRef} className="h-96" />
         )}
       </div>
+
+      {/* Drawdown + Daily P/L (Recharts overlay — themable colors) */}
+      {snapshots.length > 0 && (
+        <div className="bg-surface border border-surfaceLight rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4">Drawdown shading + Daily P/L bars</h3>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart data={ddSeries}>
+              <XAxis dataKey="time" stroke="rgb(var(--c-textMuted))" tick={{ fontSize: 10 }} />
+              <YAxis yAxisId="left" stroke="rgb(var(--c-textMuted))" tick={{ fontSize: 11 }} domain={[(min: number) => Math.floor(min * 1.1), 0]} label={{ value: 'DD %', angle: -90, position: 'insideLeft', fill: 'rgb(var(--c-textMuted))', fontSize: 11 }} />
+              <YAxis yAxisId="right" orientation="right" stroke="rgb(var(--c-textMuted))" tick={{ fontSize: 11 }} label={{ value: 'Daily P/L', angle: 90, position: 'insideRight', fill: 'rgb(var(--c-textMuted))', fontSize: 11 }} />
+              <Tooltip
+                contentStyle={{ background: 'rgb(var(--c-surface))', border: '1px solid rgb(var(--c-surfaceLight))', borderRadius: 6 }}
+                labelStyle={{ color: 'rgb(var(--c-text))' }}
+              />
+              <ReferenceLine yAxisId="right" y={0} stroke="rgb(var(--c-textMuted))" />
+              <Area yAxisId="left" type="monotone" dataKey="drawdown" stroke="rgb(var(--c-danger))" fill="rgb(var(--c-danger))" fillOpacity={0.15} />
+              <Bar yAxisId="right" dataKey="daily_pnl">
+                {ddSeries.map((d, idx) => (
+                  <Cell key={idx} fill={d.daily_pnl >= 0 ? 'rgb(var(--c-success))' : 'rgb(var(--c-danger))'} />
+                ))}
+              </Bar>
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      )}
 
       {/* Recent snapshots table */}
       {snapshots.length > 0 && (

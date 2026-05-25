@@ -1,6 +1,22 @@
 import { create } from 'zustand';
 import { API_BASE, buildWebSocketUrl } from '../lib/api';
 
+export interface ActivityEvent {
+  id: string;          // local UUID for React key
+  type: string;        // TRADE_OPENED | TRADE_CLOSED | TRADE_STATE_CHANGE | SAFETY_EVENT | EQUITY_SNAPSHOT | OPTIMIZE_PROGRESS | OPTIMIZE_DONE | INGEST_TICK | HEALTH_DELTA | SETTING_CHANGED
+  data: any;
+  ts: string;
+}
+
+export interface OptimizeProgress {
+  job_id: string;
+  combos_done: number;
+  combos_total: number;
+  runs_done: number;
+  runs_total: number;
+  pct: number;
+}
+
 interface MarketState {
   assets: string[];
   prices: Record<string, any>;
@@ -14,12 +30,21 @@ interface MarketState {
   wsConnected: boolean;
   autoTradeEnabled: boolean;
 
+  // Real-time event streams (Phase F)
+  recentEvents: ActivityEvent[];          // ring buffer, capped at 100
+  positionStates: Record<number, any>;     // by ticket (TRADE_STATE_CHANGE)
+  optimizeProgress: Record<string, OptimizeProgress>; // by job_id
+  recentSafetyEvents: ActivityEvent[];     // last 20 safety events
+  equitySeries: Array<{recorded_at: string, equity: number, daily_pnl: number}>;
+  healthDeltas: Record<string, {last_status: string, last_run?: string, last_error?: string}>;
+
   setAssets: (assets: string[]) => void;
   updateTickData: (payload: any) => void;
   updateQuantData: (symbol: string, data: any) => void;
   setConnectionStatus: (status: boolean) => void;
   setAutoTradeEnabled: (enabled: boolean) => void;
   initializeWebSocket: () => void;
+  pushEvent: (ev: ActivityEvent) => void;
 }
 
 const CACHE_PREFIX = 'hf_v7_';  // bumped from v6 after schema changes; old keys cleaned on init
@@ -82,6 +107,20 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   isFullyLoaded: Object.keys(getLocalCache('technical') || {}).length >= 28,
   wsConnected: false,
   autoTradeEnabled: true,
+
+  recentEvents: [],
+  positionStates: {},
+  optimizeProgress: {},
+  recentSafetyEvents: [],
+  equitySeries: [],
+  healthDeltas: {},
+
+  pushEvent: (ev) => set((state) => ({
+    recentEvents: [ev, ...state.recentEvents].slice(0, 100),
+    recentSafetyEvents: ev.type === 'SAFETY_EVENT'
+      ? [ev, ...state.recentSafetyEvents].slice(0, 20)
+      : state.recentSafetyEvents,
+  })),
 
   setAssets: (assets) => set({ assets }),
 
@@ -170,8 +209,58 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     ws.onmessage = (event) => {
       try {
         const payload = JSON.parse(event.data);
-        if (payload.type === 'TICK_DATA') get().updateTickData(payload);
-        else if (payload.type === 'QUANT_UPDATE') get().updateQuantData(payload.symbol, payload.data);
+        const t = payload.type;
+        if (t === 'TICK_DATA') {
+          get().updateTickData(payload);
+          return;
+        }
+        if (t === 'QUANT_UPDATE') {
+          get().updateQuantData(payload.symbol, payload.data);
+          return;
+        }
+        // Activity events (Phase F)
+        const evId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const ev: ActivityEvent = { id: evId, type: t, data: payload.data || {}, ts: payload.ts || new Date().toISOString() };
+        if (t === 'OPTIMIZE_PROGRESS') {
+          const d = payload.data || {};
+          if (d.job_id) {
+            set((state) => ({
+              optimizeProgress: { ...state.optimizeProgress, [d.job_id]: d },
+            }));
+          }
+          return; // don't pile into activity feed (too noisy)
+        }
+        if (t === 'EQUITY_SNAPSHOT') {
+          const d = payload.data || {};
+          set((state) => ({
+            equitySeries: [...state.equitySeries, {
+              recorded_at: d.recorded_at,
+              equity: d.equity,
+              daily_pnl: d.daily_pnl,
+            }].slice(-500),
+          }));
+        }
+        if (t === 'TRADE_STATE_CHANGE') {
+          const d = payload.data || {};
+          if (d.ticket) {
+            set((state) => ({
+              positionStates: { ...state.positionStates, [d.ticket]: d },
+            }));
+          }
+        }
+        if (t === 'HEALTH_DELTA') {
+          const d = payload.data || {};
+          if (d.job_id) {
+            set((state) => ({
+              healthDeltas: { ...state.healthDeltas, [d.job_id]: { last_status: d.last_status, last_run: d.last_run, last_error: d.last_error } },
+            }));
+          }
+        }
+        if (t === 'SETTING_CHANGED') {
+          // Trigger a refetch trigger by emitting event — components subscribe via selector
+        }
+        // Always push into activity feed (except OPTIMIZE_PROGRESS handled above)
+        get().pushEvent(ev);
       } catch (e) {
         console.error('WS message parse:', e);
       }

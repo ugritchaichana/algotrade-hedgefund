@@ -14,8 +14,11 @@ import TradeJournal from './pages/TradeJournal';
 import SystemHealth from './pages/SystemHealth';
 import { ToastProvider } from './lib/toast';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { CommandPalette } from './components/CommandPalette';
+import { ActivityFeed } from './components/ActivityFeed';
+import { applyTheme, getStoredTheme, type Theme } from './lib/theme';
 import { API_BASE } from './lib/api';
-import { Power, AlertTriangle } from 'lucide-react';
+import { Power, AlertTriangle, Sun, Moon, Command } from 'lucide-react';
 
 function KillSwitchButton() {
   const autoTradeEnabled = useMarketStore(state => state.autoTradeEnabled);
@@ -91,6 +94,32 @@ function KillSwitchButton() {
   );
 }
 
+function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>(getStoredTheme());
+  const flip = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    setTheme(next);
+  };
+  return (
+    <button
+      onClick={flip}
+      className="p-2 rounded-lg bg-surfaceLight hover:bg-surface transition-colors text-textMuted hover:text-text"
+      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+    >
+      {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+    </button>
+  );
+}
+
+function PaletteHint() {
+  return (
+    <div className="hidden md:flex items-center gap-1 text-xs text-textMuted px-2 py-1 border border-surfaceLight rounded">
+      <Command size={12} /> + K
+    </div>
+  );
+}
+
 function AppContent() {
   const initializeWebSocket = useMarketStore(state => state.initializeWebSocket);
   const wsConnected = useMarketStore(state => state.wsConnected);
@@ -108,7 +137,9 @@ function AppContent() {
             <h1 className="text-3xl font-bold tracking-tight text-primary">AlgoTrade</h1>
             <p className="text-textMuted text-sm mt-1">Autonomous Hedge Fund Command Center</p>
           </div>
-          <div className="flex items-center gap-4 flex-wrap">
+          <div className="flex items-center gap-3 flex-wrap">
+            <PaletteHint />
+            <ThemeToggle />
             <KillSwitchButton />
             <div className="flex items-center gap-2">
               <span className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-success animate-pulse' : 'bg-danger'}`}></span>
@@ -117,6 +148,8 @@ function AppContent() {
             <span className="text-sm font-mono text-textMuted">UTC+7</span>
           </div>
         </header>
+        <CommandPalette />
+        <ActivityFeed />
 
         <Routes>
           <Route path="/" element={<Dashboard />} />

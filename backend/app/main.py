@@ -72,6 +72,9 @@ from app.core.database import (
     HistoricalData,
     EquitySnapshot,
     TradeJournalEntry,
+    SignalState,
+    OptimizeJob,
+    PendingAction,
     log_action,
     reset_core_assets_to_defaults,
 )
@@ -96,24 +99,67 @@ log = logging.getLogger(__name__)
 
 # ===== Cached settings (invalidated on POST /api/settings) =====
 _cached_settings: dict[str, str] | None = None
+# In-memory caches BACKED BY DB (signal_state table). Kept for sub-ms read performance
+# in broadcast loops; reloaded from DB on lifespan startup so restart doesn't wipe.
 _last_notified_signal: dict[str, str | None] = {}
 _last_quant_data: dict[str, dict] = {}
 _backend_started_at: str = datetime.datetime.utcnow().isoformat()
 _last_quant_scan_time: datetime.datetime | None = None
 
-# ===== Job registry for long-running endpoints (optimize, future heavy ops) =====
-# Job lifecycle: queued -> running (with current/total updated by progress_callback) -> done | failed
-# Cleanup: jobs older than 1 hour are pruned in _gc_old_jobs (run by scheduler).
-_jobs: dict[str, dict] = {}
-_jobs_lock = asyncio.Lock()
+
+def _persist_signal_state(symbol: str, signal: str, data: dict, notified: bool = False) -> None:
+    """Upsert signal_state row. Idempotent. Called from background_quant_analysis."""
+    db = SessionLocal()
+    try:
+        row = db.query(SignalState).filter(SignalState.symbol == symbol).first()
+        now = datetime.datetime.utcnow()
+        if row is None:
+            row = SignalState(
+                symbol=symbol,
+                last_scan_at=now,
+                last_signal=signal,
+                last_data_json=json.dumps(data, default=str),
+                last_notified_signal=signal if notified else None,
+                last_notified_at=now if notified else None,
+            )
+            db.add(row)
+        else:
+            row.last_scan_at = now
+            row.last_signal = signal
+            row.last_data_json = json.dumps(data, default=str)
+            if notified:
+                row.last_notified_signal = signal
+                row.last_notified_at = now
+        db.commit()
+    except Exception as e:
+        log.error("persist_signal_state(%s) failed: %s", symbol, e)
+        db.rollback()
+    finally:
+        db.close()
 
 
-async def _gc_old_jobs():
-    cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
-    async with _jobs_lock:
-        stale = [jid for jid, j in _jobs.items() if datetime.datetime.fromisoformat(j["created_at"]) < cutoff]
-        for jid in stale:
-            del _jobs[jid]
+def _load_signal_state_into_memory() -> None:
+    """Populate _last_quant_data + _last_notified_signal from signal_state table.
+    Called once at lifespan startup so restart doesn't lose state."""
+    db = SessionLocal()
+    try:
+        rows = db.query(SignalState).all()
+        for r in rows:
+            if r.last_data_json:
+                try:
+                    _last_quant_data[r.symbol] = json.loads(r.last_data_json)
+                except Exception:
+                    pass
+            _last_notified_signal[r.symbol] = r.last_notified_signal
+        log.info("Loaded %d signal_state rows into memory", len(rows))
+    except Exception as e:
+        log.warning("_load_signal_state_into_memory failed: %s", e)
+    finally:
+        db.close()
+
+# NOTE: Long-running optimize jobs live in `optimize_jobs` table (DB-first as of 2026-05-26).
+# In-memory _jobs dict + _jobs_lock + _gc_old_jobs removed. Persistence + history + multi-tab
+# resilience handled via DB queries on /api/jobs/* endpoints.
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -224,6 +270,49 @@ def _safety_gates_pass(sym: str) -> tuple[bool, str]:
     finally:
         db.close()
 
+    # Gate 6: slippage forecast — when M1 historical_data has spread, predict current
+    # spread for this (symbol, hour-of-day) and skip if forecast >> baseline.
+    # Only fires when we have enough recent data (rolling 30d, at least 100 candles).
+    try:
+        slippage_max_mult = float(get_setting("slippage_forecast_max_mult", "3.0"))
+    except ValueError:
+        slippage_max_mult = 3.0
+    if slippage_max_mult > 0:
+        try:
+            db2 = SessionLocal()
+            try:
+                cur_hour = datetime.datetime.utcnow().hour
+                cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+                from sqlalchemy import func as _func, extract as _extract
+                row = (db2.query(_func.avg(HistoricalData.spread).label("avg_spread"),
+                                  _func.count(HistoricalData.id).label("n"))
+                       .filter(HistoricalData.symbol == sym,
+                               HistoricalData.timeframe == "M1",
+                               HistoricalData.time >= cutoff,
+                               _extract("hour", HistoricalData.time) == cur_hour,
+                               HistoricalData.spread != None)  # noqa: E711
+                       .first())
+                if row and row.n is not None and row.n >= 100 and row.avg_spread is not None:
+                    # Get all-hours baseline for comparison
+                    base = (db2.query(_func.avg(HistoricalData.spread))
+                            .filter(HistoricalData.symbol == sym,
+                                    HistoricalData.timeframe == "M1",
+                                    HistoricalData.time >= cutoff,
+                                    HistoricalData.spread != None)  # noqa: E711
+                            .scalar())
+                    if base and base > 0:
+                        ratio = float(row.avg_spread) / float(base)
+                        if ratio >= slippage_max_mult:
+                            msg = (f"{sym} slippage forecast hour={cur_hour}h: avg_spread {row.avg_spread:.1f} "
+                                   f"vs baseline {base:.1f} (ratio {ratio:.2f}x >= {slippage_max_mult}x) — skip")
+                            log.warning(msg)
+                            notify_safety_event("Slippage Forecast Block", msg)
+                            return False, "slippage_forecast_high"
+            finally:
+                db2.close()
+        except Exception as e:
+            log.debug("slippage forecast gate failed (likely no spread data yet): %s", e)
+
     return True, "ok"
 
 
@@ -237,10 +326,12 @@ _job_runtime: dict[str, dict] = {}
 
 def _tracked(job_id: str):
     """Decorator factory: wrap a scheduled job target so its last execution timestamp +
-    last error (if any) are recorded for /api/health/deep visibility."""
+    last error (if any) are recorded for /api/health/deep visibility. HEALTH_DELTA is
+    broadcast only when status flips (ok->error or error->ok) to avoid noise."""
     def deco(fn):
         def wrapper(*args, **kwargs):
             started = datetime.datetime.utcnow().isoformat()
+            prev_status = _job_runtime.get(job_id, {}).get("last_status")
             try:
                 result = fn(*args, **kwargs)
                 _job_runtime[job_id] = {
@@ -248,6 +339,12 @@ def _tracked(job_id: str):
                     "last_error": None,
                     "last_status": "ok",
                 }
+                if prev_status == "error":
+                    try:
+                        from app.core.events import broadcast_event
+                        broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "ok", "last_run": started})
+                    except Exception:
+                        pass
                 return result
             except Exception as e:
                 _job_runtime[job_id] = {
@@ -255,6 +352,12 @@ def _tracked(job_id: str):
                     "last_error": str(e)[:300],
                     "last_status": "error",
                 }
+                if prev_status != "error":
+                    try:
+                        from app.core.events import broadcast_event
+                        broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "error", "last_error": str(e)[:300], "last_run": started})
+                    except Exception:
+                        pass
                 raise
         wrapper.__name__ = fn.__name__
         return wrapper
@@ -329,9 +432,11 @@ def background_quant_analysis():
                 signal = result["signal"]
 
                 # Discord alert + auto-trade on new ENTRY signals
+                notified_this_round = False
                 if signal.startswith("ENTRY") and _last_notified_signal.get(sym) != signal:
                     notify_trade_signal(sym, result)
                     _last_notified_signal[sym] = signal
+                    notified_this_round = True
 
                     allowed, reason = _safety_gates_pass(sym)
                     if not allowed:
@@ -373,8 +478,22 @@ def background_quant_analysis():
                                 db.close()
                         else:
                             log_action("AutoTrader", "Trade Failed", f"{sym}: {trade_res.get('error')}")
+                            # Enqueue retry for transient failures (spread/ping/MT5 disconnect)
+                            try:
+                                from app.services.retry_worker import enqueue_retry
+                                enqueue_retry(
+                                    symbol=sym,
+                                    signal_data=result,
+                                    reason=trade_res.get("reason", "unknown"),
+                                    error=trade_res.get("error", ""),
+                                )
+                            except Exception as re:
+                                log.warning("enqueue_retry failed: %s", re)
                 elif not signal.startswith("ENTRY"):
                     _last_notified_signal[sym] = None
+
+                # Persist to signal_state DB (survives restart, multi-tab consistency)
+                _persist_signal_state(sym, signal, result, notified=notified_this_round)
 
                 if _uvicorn_loop:
                     asyncio.run_coroutine_threadsafe(
@@ -429,7 +548,65 @@ async def lifespan(app: FastAPI):
     log.info("Starting up — init_db + MT5 + scheduler")
     init_db()
     init_mt5()
-    
+
+    # Wire WS event broadcaster (used by service modules without circular import)
+    from app.core.events import attach as attach_events
+    attach_events(_uvicorn_loop, manager, is_shutting_down)
+
+    # === Autonomous self-heal on startup ===
+
+    # 1. Mark interrupted optimize jobs (running/queued at last shutdown -> interrupted)
+    _db = SessionLocal()
+    try:
+        stale_jobs = _db.query(OptimizeJob).filter(OptimizeJob.status.in_(["queued", "running"])).all()
+        for sj in stale_jobs:
+            sj.status = "interrupted"
+            sj.error = "Backend restart during execution"
+            if not sj.completed_at:
+                sj.completed_at = datetime.datetime.utcnow()
+        if stale_jobs:
+            _db.commit()
+            log.info("Self-heal: marked %d interrupted optimize jobs", len(stale_jobs))
+    except Exception as e:
+        log.warning("Startup: mark interrupted jobs failed: %s", e)
+    finally:
+        _db.close()
+
+    # 2. Reload signal_state into in-memory cache (gates Discord re-spam after restart)
+    _load_signal_state_into_memory()
+
+    # 3. Drop expired pending_actions (signal too stale to retry meaningfully)
+    _db = SessionLocal()
+    try:
+        from app.core.database import PendingAction as _PA
+        now = datetime.datetime.utcnow()
+        expired = _db.query(_PA).filter(_PA.status == "pending", _PA.expires_at < now).all()
+        for p in expired:
+            p.status = "expired"
+        if expired:
+            _db.commit()
+            log.info("Self-heal: expired %d stale pending_actions", len(expired))
+    except Exception as e:
+        log.warning("Startup: pending_actions expire failed: %s", e)
+    finally:
+        _db.close()
+
+    # 4. Drop expired pending_actions older than 24h regardless of status (keeps DB lean)
+    _db = SessionLocal()
+    try:
+        from app.core.database import PendingAction as _PA
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+        old = _db.query(_PA).filter(_PA.created_at < cutoff).all()
+        for p in old:
+            _db.delete(p)
+        if old:
+            _db.commit()
+            log.info("Self-heal: purged %d ancient pending_actions (>7 days)", len(old))
+    except Exception as e:
+        log.warning("Startup: ancient pending_actions purge failed: %s", e)
+    finally:
+        _db.close()
+
     from app.services.discord_notifier import notify_system_startup
     notify_system_startup()
 
@@ -459,6 +636,31 @@ async def lifespan(app: FastAPI):
         id='equity_snapshot',
         coalesce=True,
         misfire_grace_time=300,
+    )
+
+    # Retry queue drainer (pending_actions table) — runs every 1min, piggybacks ingest_m1 cadence
+    from app.services.retry_worker import drain_pending_actions
+    scheduler.add_job(
+        _tracked("retry_worker")(lambda: drain_pending_actions(is_shutting_down)),
+        "interval",
+        minutes=1,
+        id="retry_worker",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+
+    # Auto-optimize monthly cron — 1st of month at 02:00 UTC+7 (= 19:00 UTC previous day)
+    from app.services.auto_optimize import run_monthly_auto_optimize
+    scheduler.add_job(
+        _tracked("auto_optimize_monthly")(run_monthly_auto_optimize),
+        "cron",
+        day=1,
+        hour=19,
+        minute=0,
+        id="auto_optimize_monthly",
+        coalesce=True,
+        max_instances=1,
     )
     scheduler.start()
 
@@ -825,6 +1027,124 @@ def journal_list(days: int = 30, symbol: str | None = None, side: str | None = N
         db_.close()
 
 
+# Edge vs Noise classification — decisive Phase 2 demo decision tool.
+# Edge = strategy thesis worked: PARTIAL_TP + TRAIL_SL after stage 3+ + TP
+# Noise = exit didn't pass through trailing logic: initial SL + early TRAIL_SL (stage 1 or 2)
+_EDGE_REASONS = {"PARTIAL_TP", "TP", "Take Profit"}
+_NOISE_REASONS = {"SL", "Stop Loss", "Manual Close"}
+
+
+def _classify_attribution(exit_reason: str | None, r_multiple: float | None) -> str:
+    """Bucket each trade into 'edge', 'noise', or 'mixed'.
+
+    Edge = thesis trades (partial close hit OR full TP hit OR trail-out at >= 2R).
+    Noise = stopped out before trail had time to advance (initial SL or low-R close).
+    Mixed = late-stage trail exits (manual / unclear / system close)."""
+    if exit_reason is None:
+        return "open"
+    er = (exit_reason or "").strip()
+    if er in _EDGE_REASONS:
+        return "edge"
+    if er.startswith("TRAIL_SL") or er == "Trail SL":
+        return "edge" if (r_multiple or 0) >= 1.5 else "noise"
+    if er in _NOISE_REASONS:
+        return "noise"
+    return "mixed"
+
+
+def _aggregate_bucket(trades: list) -> dict:
+    if not trades:
+        return {"count": 0, "win_rate": 0.0, "avg_r": 0.0, "total_pnl": 0.0, "profit_factor": 0.0}
+    wins = [t for t in trades if (t.pnl or 0) > 0]
+    losses = [t for t in trades if (t.pnl or 0) < 0]
+    gross_profit = sum(t.pnl or 0 for t in wins)
+    gross_loss = abs(sum(t.pnl or 0 for t in losses))
+    pf = (gross_profit / gross_loss) if gross_loss > 0 else float("inf") if gross_profit > 0 else 0.0
+    return {
+        "count": len(trades),
+        "win_rate": round(len(wins) / len(trades) * 100, 2),
+        "avg_r": round(sum(t.r_multiple or 0 for t in trades) / len(trades), 3),
+        "total_pnl": round(sum(t.pnl or 0 for t in trades), 2),
+        "profit_factor": round(pf, 3) if pf != float("inf") else None,
+    }
+
+
+@app.get("/api/journal/attribution")
+def journal_attribution(days: int = 30, symbol: str | None = None):
+    """Edge vs Noise breakdown — decisive Phase 2 decision tool.
+
+    Returns:
+      - overall: aggregate metrics across all closed trades in window
+      - edge: trades where strategy thesis worked (partial close, TP, stage 3+ trail)
+      - noise: trades stopped out early (initial SL or sub-1.5R trail)
+      - mixed: ambiguous (manual close, system exits)
+      - by_exit_reason: distribution of exit reasons
+      - r_distribution: histogram bins [-3, -2, -1, 0, 1, 2, 3, 4+]
+      - by_symbol: per-symbol breakdown
+    """
+    db_ = SessionLocal()
+    try:
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        q = db_.query(TradeJournalEntry).filter(
+            TradeJournalEntry.opened_at >= cutoff,
+            TradeJournalEntry.closed_at != None,  # noqa: E711  (closed trades only)
+        )
+        if symbol:
+            q = q.filter(TradeJournalEntry.symbol.ilike(f"%{symbol}%"))
+        trades = q.all()
+
+        edge_trades = []
+        noise_trades = []
+        mixed_trades = []
+        for t in trades:
+            bucket = _classify_attribution(t.exit_reason, t.r_multiple)
+            if bucket == "edge":
+                edge_trades.append(t)
+            elif bucket == "noise":
+                noise_trades.append(t)
+            elif bucket == "mixed":
+                mixed_trades.append(t)
+
+        # R-multiple distribution
+        bins = {"<-2": 0, "-2 to -1": 0, "-1 to 0": 0, "0 to 1": 0, "1 to 1.5": 0, "1.5 to 2": 0, "2 to 3": 0, ">=3": 0}
+        for t in trades:
+            r = t.r_multiple or 0
+            if r < -2: bins["<-2"] += 1
+            elif r < -1: bins["-2 to -1"] += 1
+            elif r < 0: bins["-1 to 0"] += 1
+            elif r < 1: bins["0 to 1"] += 1
+            elif r < 1.5: bins["1 to 1.5"] += 1
+            elif r < 2: bins["1.5 to 2"] += 1
+            elif r < 3: bins["2 to 3"] += 1
+            else: bins[">=3"] += 1
+
+        # By exit_reason
+        by_reason: dict = {}
+        for t in trades:
+            r_key = t.exit_reason or "unknown"
+            by_reason.setdefault(r_key, []).append(t)
+        by_reason_out = {k: _aggregate_bucket(v) for k, v in by_reason.items()}
+
+        # By symbol
+        by_sym: dict = {}
+        for t in trades:
+            by_sym.setdefault(t.symbol, []).append(t)
+        by_sym_out = {k: _aggregate_bucket(v) for k, v in by_sym.items()}
+
+        return {
+            "window_days": days,
+            "overall": _aggregate_bucket(trades),
+            "edge": _aggregate_bucket(edge_trades),
+            "noise": _aggregate_bucket(noise_trades),
+            "mixed": _aggregate_bucket(mixed_trades),
+            "r_distribution": bins,
+            "by_exit_reason": by_reason_out,
+            "by_symbol": by_sym_out,
+        }
+    finally:
+        db_.close()
+
+
 # ===== Analysis =====
 @app.get("/api/analysis/quant")
 def get_quant_analysis():
@@ -1185,8 +1505,9 @@ async def backtest(req: BacktestRequest):
 async def backtest_optimize(req: OptimizeRequest):
     """Long-running grid search — returns a job_id immediately. Poll /api/jobs/{job_id} for status + result.
 
-    The optimization runs in a worker thread (asyncio.to_thread) so the FastAPI event loop
-    keeps pumping WebSocket TICK_DATA + serving other endpoints while it works.
+    Job state persists to optimize_jobs DB table: survives backend restart, closing browser tab
+    doesn't lose progress, and the run is part of permanent history. Old _jobs in-memory dict
+    decommissioned in favor of DB-first.
     """
     symbols = req.symbols
     if symbols == ["ALL"] or "ALL" in symbols:
@@ -1195,42 +1516,79 @@ async def backtest_optimize(req: OptimizeRequest):
         return {"ok": False, "error": "symbols list is empty"}
 
     job_id = str(uuid.uuid4())
-    now = datetime.datetime.utcnow().isoformat()
-    async with _jobs_lock:
-        _jobs[job_id] = {
-            "id": job_id,
-            "kind": "optimize",
-            "status": "queued",
-            "created_at": now,
-            "started_at": None,
-            "finished_at": None,
-            "progress": {"combos_done": 0, "combos_total": 0, "runs_done": 0, "runs_total": 0, "pct": 0.0},
-            "result": None,
-            "error": None,
-            "config": {
-                "symbols": symbols,
-                "start_date": req.start_date,
-                "end_date": req.end_date,
-                "rank_by": req.rank_by,
-            },
-        }
+    request_payload = {
+        "symbols": symbols,
+        "start_date": req.start_date,
+        "end_date": req.end_date,
+        "sweeps": req.sweeps,
+        "fixed": req.fixed,
+        "rank_by": req.rank_by,
+        "top_n": req.top_n,
+        "walk_forward": req.walk_forward,
+        "train_ratio": req.train_ratio,
+        "parallel": req.parallel,
+    }
+    db = SessionLocal()
+    try:
+        db.add(OptimizeJob(
+            id=job_id,
+            status="queued",
+            progress_current=0,
+            progress_total=0,
+            request_json=json.dumps(request_payload),
+            triggered_by="user_ui",
+        ))
+        db.commit()
+    finally:
+        db.close()
 
     async def _run_job():
-        async with _jobs_lock:
-            _jobs[job_id]["status"] = "running"
-            _jobs[job_id]["started_at"] = datetime.datetime.utcnow().isoformat()
+        # Mark running
+        db = SessionLocal()
+        try:
+            row = db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+            if row:
+                row.status = "running"
+                row.started_at = datetime.datetime.utcnow()
+                db.commit()
+        finally:
+            db.close()
+
+        # Throttle DB writes: progress callback fires per combo, can be 100s of times.
+        # Update DB max once per 500ms; broadcast WS more often (lighter).
+        last_db_write = [0.0]
 
         def progress_cb(combos_done: int, combos_total: int, runs_done: int, runs_total: int):
-            pct = round((runs_done / runs_total) * 100, 1) if runs_total else 0
-            _jobs[job_id]["progress"] = {
+            import time
+            now = time.time()
+            payload = {
+                "job_id": job_id,
                 "combos_done": combos_done,
                 "combos_total": combos_total,
                 "runs_done": runs_done,
                 "runs_total": runs_total,
-                "pct": pct,
+                "pct": round((runs_done / runs_total) * 100, 1) if runs_total else 0,
             }
+            try:
+                from app.core.events import broadcast_event
+                broadcast_event("OPTIMIZE_PROGRESS", payload)
+            except Exception:
+                pass
+            # Throttled DB write
+            if now - last_db_write[0] >= 0.5:
+                last_db_write[0] = now
+                _db = SessionLocal()
+                try:
+                    row = _db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+                    if row:
+                        row.progress_current = runs_done
+                        row.progress_total = runs_total
+                        _db.commit()
+                finally:
+                    _db.close()
 
         try:
+            start_ts = datetime.datetime.utcnow()
             result = await asyncio.to_thread(
                 run_optimization,
                 symbols=symbols,
@@ -1247,50 +1605,150 @@ async def backtest_optimize(req: OptimizeRequest):
                 walk_forward=req.walk_forward,
                 train_ratio=req.train_ratio,
             )
-            async with _jobs_lock:
-                _jobs[job_id]["status"] = "done"
-                _jobs[job_id]["result"] = result
-                _jobs[job_id]["finished_at"] = datetime.datetime.utcnow().isoformat()
+            db = SessionLocal()
+            try:
+                row = db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+                if row:
+                    row.status = "done"
+                    row.result_json = json.dumps(result, default=str)
+                    row.completed_at = datetime.datetime.utcnow()
+                    row.duration_seconds = (row.completed_at - start_ts).total_seconds()
+                    db.commit()
+            finally:
+                db.close()
+            try:
+                from app.core.events import broadcast_event
+                broadcast_event("OPTIMIZE_DONE", {"job_id": job_id, "status": "done"})
+            except Exception:
+                pass
         except Exception as e:
             log.error("Optimize job %s failed: %s", job_id, e)
-            async with _jobs_lock:
-                _jobs[job_id]["status"] = "failed"
-                _jobs[job_id]["error"] = str(e)
-                _jobs[job_id]["finished_at"] = datetime.datetime.utcnow().isoformat()
+            db = SessionLocal()
+            try:
+                row = db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+                if row:
+                    row.status = "failed"
+                    row.error = str(e)[:1000]
+                    row.completed_at = datetime.datetime.utcnow()
+                    db.commit()
+            finally:
+                db.close()
+            try:
+                from app.core.events import broadcast_event
+                broadcast_event("OPTIMIZE_DONE", {"job_id": job_id, "status": "failed", "error": str(e)[:200]})
+            except Exception:
+                pass
 
     asyncio.create_task(_run_job())
     return {"ok": True, "job_id": job_id, "status": "queued"}
 
 
+def _serialize_optimize_job(row: OptimizeJob, include_result: bool = True) -> dict:
+    return {
+        "id": row.id,
+        "kind": "optimize",
+        "status": row.status,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.completed_at.isoformat() if row.completed_at else None,
+        "duration_seconds": row.duration_seconds,
+        "progress": {
+            "runs_done": row.progress_current,
+            "runs_total": row.progress_total,
+            "pct": round((row.progress_current / row.progress_total) * 100, 1) if row.progress_total else 0,
+        },
+        "config": json.loads(row.request_json) if row.request_json else None,
+        "result": (json.loads(row.result_json) if (row.result_json and include_result) else None),
+        "has_result": bool(row.result_json),
+        "error": row.error,
+        "triggered_by": row.triggered_by,
+    }
+
+
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    async with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
+def get_job(job_id: str):
+    db = SessionLocal()
+    try:
+        row = db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+        if not row:
             return {"ok": False, "error": "job not found", "status": "not_found"}
-        return job
+        return _serialize_optimize_job(row, include_result=True)
+    finally:
+        db.close()
 
 
 @app.get("/api/jobs")
-async def list_jobs(limit: int = 20):
-    async with _jobs_lock:
-        recent = sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)[:limit]
-        # Strip the heavy `result` field from list view — keep summary only
-        return {
-            "jobs": [
-                {**j, "result": None, "has_result": j.get("result") is not None}
-                for j in recent
-            ]
-        }
+def list_jobs(limit: int = 20, status: str | None = None):
+    db = SessionLocal()
+    try:
+        q = db.query(OptimizeJob)
+        if status:
+            q = q.filter(OptimizeJob.status == status)
+        rows = q.order_by(OptimizeJob.created_at.desc()).limit(limit).all()
+        return {"jobs": [_serialize_optimize_job(r, include_result=False) for r in rows]}
+    finally:
+        db.close()
+
+
+@app.get("/api/system/watchdog")
+def system_watchdog():
+    """External watchdog endpoint. Returns 200 OK only if ALL critical autonomous loops
+    have run within their expected cadence (auto-restart scripts can hit this and trigger
+    NSSM/cron to restart on persistent failure)."""
+    now = datetime.datetime.utcnow()
+    failures = []
+
+    # tick_broadcast should fire every 2s → last_run within 30s
+    tick_runtime = _job_runtime.get("tick_broadcast", {})
+    if tick_runtime.get("last_run"):
+        try:
+            last = datetime.datetime.fromisoformat(tick_runtime["last_run"])
+            if (now - last).total_seconds() > 30:
+                failures.append(f"tick_broadcast stale: {(now - last).total_seconds():.0f}s")
+        except Exception:
+            failures.append("tick_broadcast last_run unparseable")
+    else:
+        failures.append("tick_broadcast never ran")
+
+    # MT5 must be connected + trade_allowed
+    mt5_h = check_terminal_health()
+    if not mt5_h.get("connected"):
+        failures.append("MT5 disconnected")
+    if not mt5_h.get("trade_allowed"):
+        failures.append("MT5 trade_allowed=false")
+
+    # Scheduler must be alive
+    if not scheduler.running:
+        failures.append("scheduler not running")
+
+    if failures:
+        return JSONResponse(status_code=503, content={"ok": False, "failures": failures})
+    return {"ok": True, "checked_at": now.isoformat()}
+
+
+@app.post("/api/optimize/auto-refresh")
+async def trigger_auto_optimize():
+    """Manual trigger for the monthly auto-optimize pipeline. Returns immediately;
+    progress + result via WS OPTIMIZE_DONE event + /api/jobs/{id}."""
+    from app.services.auto_optimize import run_monthly_auto_optimize
+    async def _run():
+        await asyncio.to_thread(run_monthly_auto_optimize)
+    asyncio.create_task(_run())
+    return {"ok": True, "status": "triggered", "note": "Watch WS OPTIMIZE_DONE event or /api/jobs?triggered_by=auto_cron"}
 
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job(job_id: str):
-    async with _jobs_lock:
-        if job_id in _jobs:
-            del _jobs[job_id]
-            return {"ok": True}
-        return {"ok": False, "error": "not found"}
+def delete_job(job_id: str):
+    db = SessionLocal()
+    try:
+        row = db.query(OptimizeJob).filter(OptimizeJob.id == job_id).first()
+        if not row:
+            return {"ok": False, "error": "not found"}
+        db.delete(row)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
 
 
 # ===== Settings + kill switch =====
@@ -1321,6 +1779,13 @@ async def settings_update(payload: SettingUpdate, db: Session = Depends(get_db))
         invalidate_risk_cache()
         if scheduler.running:
             asyncio.create_task(_safe_call(background_quant_analysis, "settings_re_analysis"))
+
+    # Broadcast to all WS clients so other tabs reflect the change
+    try:
+        from app.core.events import broadcast_event
+        broadcast_event("SETTING_CHANGED", {"key": payload.key, "value": payload.value})
+    except Exception:
+        pass
 
     return {"status": "success", "key": payload.key, "value": payload.value}
 

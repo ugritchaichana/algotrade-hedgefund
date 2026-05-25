@@ -12,7 +12,9 @@ from sqlalchemy import (
     Text,
     Boolean,
     UniqueConstraint,
+    Index,
     inspect,
+    text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
@@ -53,6 +55,8 @@ class HistoricalData(Base):
     low_price = Column(Float)
     close_price = Column(Float)
     tick_volume = Column(Integer)
+    spread = Column(Integer, nullable=True)        # MT5 per-candle spread (points), populated 2026-05-26+
+    real_volume = Column(Integer, nullable=True)   # MT5 real volume — 0 on many CFD brokers, NULL if broker doesn't provide
     __table_args__ = (
         UniqueConstraint("symbol", "timeframe", "time", name="uq_hist_symtftime"),
     )
@@ -104,6 +108,68 @@ class EquitySnapshot(Base):
     floating_pnl = Column(Float, default=0.0)
 
 
+class SignalState(Base):
+    """Per-symbol last scan result + last notified signal — survives backend restart.
+
+    Replaces in-memory _last_quant_data + _last_notified_signal dicts in main.py.
+    Prevents Discord re-spam of identical ENTRY signals after restart + lets frontend
+    re-render last known signal immediately on (re)connect.
+    """
+    __tablename__ = "signal_state"
+    symbol = Column(String(20), primary_key=True)
+    last_scan_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    last_signal = Column(String(30))
+    last_data_json = Column(Text)
+    last_notified_signal = Column(String(30), nullable=True)
+    last_notified_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        onupdate=datetime.datetime.utcnow)
+
+
+class OptimizeJob(Base):
+    """Persistent optimize job state. Replaces in-memory _jobs dict in main.py.
+
+    Survives backend restart (status flipped queued/running -> interrupted on startup).
+    Frontend can close tab + reconnect to see progress. Enables Run history view.
+    """
+    __tablename__ = "optimize_jobs"
+    id = Column(String(36), primary_key=True)  # UUID string
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    status = Column(String(15), default="queued")  # queued/running/done/failed/interrupted
+    progress_current = Column(Integer, default=0)
+    progress_total = Column(Integer, default=0)
+    request_json = Column(Text)
+    result_json = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    triggered_by = Column(String(20), default="user_ui")  # user_ui / auto_cron / api
+
+
+class PendingAction(Base):
+    """Retry queue for transient-failure trades. Worker drains every 1min.
+
+    Reasons that enqueue: spread spike, ping spike, mt5 disconnect, broker requote/no_quotes
+    Reasons that DON'T enqueue (stale or terminal): max_positions, daily_dd, kill_switch,
+    idempotent_duplicate, bad_params, symbol_missing
+    """
+    __tablename__ = "pending_actions"
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    type = Column(String(20), default="trade_entry")
+    symbol = Column(String(20), index=True)
+    signal_data_json = Column(Text)
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=12)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_reason = Column(String(40), nullable=True)
+    last_error = Column(Text, nullable=True)
+    status = Column(String(15), default="pending", index=True)  # pending/succeeded/expired/cancelled
+    expires_at = Column(DateTime, index=True)
+    resolved_ticket = Column(Integer, nullable=True)
+
+
 class TradeJournalEntry(Base):
     """Durable per-trade record. Populated by execution_desk + trade_manager."""
     __tablename__ = "trade_journal"
@@ -128,17 +194,20 @@ class TradeJournalEntry(Base):
 
 
 def _migrate_schema_if_needed():
-    """Detect schema drift on critical tables; drop + recreate when columns mismatch.
+    """Detect schema drift on critical tables; drop + recreate when columns mismatch,
+    OR add nullable columns via ALTER TABLE when only optional fields are missing.
 
-    Safe to call repeatedly — only drops when the live schema disagrees with the model.
+    Safe to call repeatedly — only drops when the live schema disagrees with the model
+    in a way that ALTER TABLE can't fix. Otherwise additive ALTER COLUMN.
     No-ops once the schema is aligned.
     """
     inspector = inspect(engine)
     drops = []
+    additive_alters: list[tuple[str, str, str]] = []  # (table, column, SQL DDL fragment)
 
     if inspector.has_table("historical_data"):
         live_cols = {c["name"] for c in inspector.get_columns("historical_data")}
-        expected = {
+        required = {
             "id",
             "symbol",
             "timeframe",
@@ -149,9 +218,15 @@ def _migrate_schema_if_needed():
             "close_price",
             "tick_volume",
         }
-        if not expected.issubset(live_cols):
-            log.warning("historical_data schema drift detected — dropping for recreate")
+        if not required.issubset(live_cols):
+            log.warning("historical_data missing required columns — dropping for recreate")
             drops.append(HistoricalData.__table__)
+        else:
+            # Optional additive columns — don't drop, just ALTER ADD (preserves data)
+            if "spread" not in live_cols:
+                additive_alters.append(("historical_data", "spread", "INTEGER NULL"))
+            if "real_volume" not in live_cols:
+                additive_alters.append(("historical_data", "real_volume", "BIGINT NULL"))
 
     if inspector.has_table("trade_states"):
         cols = {c["name"]: c for c in inspector.get_columns("trade_states")}
@@ -170,6 +245,15 @@ def _migrate_schema_if_needed():
     if drops:
         for tbl in drops:
             tbl.drop(bind=engine, checkfirst=True)
+
+    if additive_alters:
+        with engine.begin() as conn:
+            for table, col, ddl in additive_alters:
+                try:
+                    conn.execute(text(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ddl}'))
+                    log.info("migrated: added %s.%s (%s)", table, col, ddl)
+                except Exception as e:
+                    log.warning("ALTER TABLE %s ADD %s failed: %s", table, col, e)
 
 
 def init_db():
@@ -212,6 +296,8 @@ def _seed_default_settings() -> None:
             "max_daily_drawdown_pct": "3.0",
             "max_daily_trades": "8",
             "access_pin": "130944",
+            "auto_apply_on_drift": "false",  # Auto-apply optimizer winners (Phase B)
+            "slippage_forecast_max_mult": "3.0",  # Skip trade if hour-of-day spread > 3x baseline
         }
         existing = {row.key for row in db.query(SystemSettings).all()}
         for key, value in defaults.items():

@@ -21,15 +21,22 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        text_data = json.dumps(message)
-        dead: List[WebSocket] = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(text_data)
-            except Exception:
-                dead.append(connection)
-        for d in dead:
-            self.disconnect(d)
+        """Parallel send to all connections. Failures don't block others."""
+        if not self.active_connections:
+            return
+        try:
+            text_data = json.dumps(message, default=str)
+        except Exception as e:
+            log.warning("broadcast: JSON serialize failed: %s", e)
+            return
+        connections = list(self.active_connections)
+        results = await asyncio.gather(
+            *[c.send_text(text_data) for c in connections],
+            return_exceptions=True,
+        )
+        for conn, result in zip(connections, results):
+            if isinstance(result, Exception):
+                self.disconnect(conn)
 
 
 manager = ConnectionManager()
