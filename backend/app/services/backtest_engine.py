@@ -180,7 +180,11 @@ def _cost(spread_pips: float, slippage_pips: float, lot: float, meta: dict,
         return 0.0
     point_value = meta["tick_value"] / meta["tick_size"]
     pip_value = meta["pip_size"] * point_value
-    if actual_spread_points is not None and meta.get("point") and meta.get("pip_size"):
+    # Treat actual_spread_points <= 0 as missing — some brokers return 0 for historical
+    # M1 spread when they don't track it. Falling through to flat parameter avoids the
+    # "cost = 0 → PF explodes" bug that inflated Run 11 OOS PF to absurd values.
+    if (actual_spread_points is not None and actual_spread_points > 0
+            and meta.get("point") and meta.get("pip_size")):
         # Convert MT5 spread (in points) to pips. points_per_pip = pip_size / point.
         points_per_pip = meta["pip_size"] / meta["point"]
         effective_spread_pips = float(actual_spread_points) / points_per_pip if points_per_pip > 0 else spread_pips

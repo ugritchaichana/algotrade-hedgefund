@@ -1,11 +1,54 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useMarketStore } from '../store/useMarketStore';
 import { Crosshair, Activity, TrendingUp, TrendingDown } from 'lucide-react';
+import { API_BASE } from '../lib/api';
+
+interface RecentClosedDeal {
+  ticket: number;
+  symbol: string;
+  side: string;
+  closed_at: string | null;
+  exit_price: number | null;
+  pnl: number | null;
+  r_multiple: number | null;
+  exit_reason: string | null;
+  lot: number;
+}
 
 const ExecutionDesk = () => {
   const technical = useMarketStore(state => state.technical);
   const orders = useMarketStore(state => state.orders);
   const accountStatus = useMarketStore(state => state.accountStatus);
+  const recentEvents = useMarketStore(state => state.recentEvents);
+  const [recentClosed, setRecentClosed] = useState<RecentClosedDeal[]>([]);
+
+  // Initial fetch from trade_journal (more reliable than accountStatus.recent_history)
+  useEffect(() => {
+    fetch(`${API_BASE}/api/journal?days=7`)
+      .then(r => r.json())
+      .then(d => {
+        const closed = (d.rows || [])
+          .filter((r: any) => r.closed_at && r.pnl !== null)
+          .slice(0, 10);
+        setRecentClosed(closed);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Live refresh when TRADE_CLOSED WS event arrives
+  useEffect(() => {
+    const lastClose = recentEvents.find(e => e.type === 'TRADE_CLOSED');
+    if (!lastClose) return;
+    fetch(`${API_BASE}/api/journal?days=7`)
+      .then(r => r.json())
+      .then(d => {
+        const closed = (d.rows || [])
+          .filter((r: any) => r.closed_at && r.pnl !== null)
+          .slice(0, 10);
+        setRecentClosed(closed);
+      })
+      .catch(() => {});
+  }, [recentEvents.filter(e => e.type === 'TRADE_CLOSED').length]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -101,15 +144,21 @@ const ExecutionDesk = () => {
               <h3 className="text-lg font-semibold text-textMuted">Recent Closed Deals</h3>
             </div>
             <div className="flex flex-col gap-2 overflow-y-auto custom-scrollbar flex-1 max-h-[300px]">
-              {accountStatus?.recent_history && accountStatus.recent_history.length > 0 ? (
-                accountStatus.recent_history.slice().reverse().slice(0, 10).map(deal => (
+              {recentClosed.length > 0 ? (
+                recentClosed.map(deal => (
                   <div key={deal.ticket} className="flex justify-between items-center text-xs bg-background p-3 rounded border border-surfaceLight">
-                    <div>
-                      <span className="font-bold text-sm">{deal.symbol}</span>
-                      <span className="text-textMuted ml-3">{deal.type} {deal.volume}</span>
+                    <div className="flex flex-col">
+                      <div>
+                        <span className="font-bold text-sm">{deal.symbol}</span>
+                        <span className={`ml-2 text-xs font-bold ${deal.side === 'BUY' ? 'text-success' : 'text-danger'}`}>{deal.side}</span>
+                        <span className="text-textMuted ml-2">{deal.lot} lot</span>
+                      </div>
+                      <div className="text-textMuted text-[10px] mt-0.5">
+                        {deal.exit_reason || '—'} · {deal.r_multiple !== null ? `${deal.r_multiple.toFixed(2)}R` : ''}
+                      </div>
                     </div>
-                    <span className={`font-mono font-bold ${deal.profit >= 0 ? 'text-success' : 'text-danger'}`}>
-                      {deal.profit >= 0 ? '+' : ''}${deal.profit.toFixed(2)}
+                    <span className={`font-mono font-bold ${(deal.pnl ?? 0) >= 0 ? 'text-success' : 'text-danger'}`}>
+                      {(deal.pnl ?? 0) >= 0 ? '+' : ''}${(deal.pnl ?? 0).toFixed(2)}
                     </span>
                   </div>
                 ))

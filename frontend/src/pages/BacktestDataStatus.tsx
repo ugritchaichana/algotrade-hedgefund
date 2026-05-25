@@ -78,7 +78,9 @@ const BacktestDataStatus = () => {
     bySymbol[r.symbol][r.timeframe] = r;
   });
   const symbols = Object.keys(bySymbol).sort();
-  const timeframes = ['D1', 'H4', 'H1'];
+  // Show M1 column too — ingested every 1min as of 2026-05-26. Order is coarsest→finest
+  // so the table reads left-to-right as macro→intraday.
+  const timeframes = ['D1', 'H4', 'H1', 'M1'];
 
   const totalCandles = rows.reduce((sum, r) => sum + r.count, 0);
 

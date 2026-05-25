@@ -191,17 +191,27 @@ def sync_closed_positions():
 def _process_closed_trade(db, trade):
     from app.services.discord_notifier import notify_trade_closed
     from app.core.database import TradeState
-    
+
     now = datetime.datetime.utcnow()
     from_date = now - datetime.timedelta(days=30)
+    # NOTE: position= keyword filter in mt5.history_deals_get is unreliable across
+    # MT5 builds — some return ALL deals in date range regardless. Always re-filter
+    # in Python by position_id to guarantee we only see deals belonging to this trade.
     deals = mt5.history_deals_get(from_date, now, position=trade.ticket)
-    
+
     if not deals:
         log.warning("sync_closed_positions: No deals found for closed ticket %s", trade.ticket)
         return
-        
-    out_deals = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
+
+    out_deals = [
+        d for d in deals
+        if d.entry == mt5.DEAL_ENTRY_OUT
+        and getattr(d, "position_id", None) == trade.ticket
+    ]
     if not out_deals:
+        log.warning("sync_closed_positions: No DEAL_ENTRY_OUT matching position_id=%s "
+                    "(returned %d deals but none belonged to this ticket — MT5 position= filter ignored?)",
+                    trade.ticket, len(deals))
         return
         
     total_pnl = sum(d.profit + d.commission + d.swap for d in out_deals)

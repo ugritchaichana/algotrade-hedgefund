@@ -1,9 +1,26 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Zap, Loader2, Copy, Check, ChevronDown, ChevronUp, X, Target, FileDown } from 'lucide-react';
+import { Zap, Loader2, Copy, Check, ChevronDown, ChevronUp, X, Target, FileDown, History, Clock } from 'lucide-react';
 import { useMarketStore } from '../store/useMarketStore';
 import CalendarPicker from '../components/CalendarPicker';
 import { useToast } from '../lib/toast';
 import { API_BASE } from '../lib/api';
+
+const ACTIVE_JOB_KEY = 'algotrade_active_optimize_job';
+
+interface OptimizeJobMeta {
+  id: string;
+  status: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  progress: { runs_done: number; runs_total: number; pct: number };
+  config: any;
+  result: any;
+  has_result: boolean;
+  error: string | null;
+  triggered_by: string;
+}
 
 interface SweepConfig {
   enabled: boolean;
@@ -13,15 +30,18 @@ interface SweepConfig {
   type: 'float' | 'int';
 }
 
-// Defaults centered around walk-forward-validated values (SL=0.5, TP=4, RSI 40-55)
+// Defaults centered around walk-forward-validated values (SL=0.25, TP=4, RSI 40-55)
+// NOTE: tp_atr_mult is REJECTED by backend OptimizeRequest validator (T3#14, commit 2cbfc8b)
+// because Run 2 (2026-05-24) proved TP is decorative — exits always fire via PARTIAL_TP/TRAIL_SL
+// before TP. Default disabled. If enabled here, the run() handler moves it to `fixed` automatically.
 const DEFAULT_SWEEPS: Record<string, SweepConfig> = {
-  sl_atr_mult: { enabled: true, values: '0.5, 0.75, 1.0, 1.5', label: 'SL ATR multiplier', description: 'Stop loss width in ATR units. Validated optimum: 0.5 (tight)', type: 'float' },
-  tp_atr_mult: { enabled: true, values: '3, 4, 5, 6', label: 'TP ATR multiplier', description: 'Take profit distance in ATR units. Validated optimum: 4 (trailing usually exits earlier)', type: 'float' },
-  rsi_entry_low: { enabled: true, values: '40, 45, 50', label: 'RSI lower bound', description: 'Lower edge of RSI entry zone. Validated optimum: 40', type: 'float' },
-  rsi_entry_high: { enabled: true, values: '55, 60', label: 'RSI upper bound', description: 'Upper edge of RSI entry zone. Validated optimum: 55', type: 'float' },
-  sma_fast_period: { enabled: false, values: '15, 20, 25', label: 'SMA fast period', description: 'Fast SMA on D1 and H4', type: 'int' },
-  sma_slow_period: { enabled: false, values: '40, 50, 60', label: 'SMA slow period', description: 'Slow SMA on D1 and H4', type: 'int' },
-  vma_period: { enabled: false, values: '15, 20, 25', label: 'VMA period', description: 'Volume MA on H1', type: 'int' },
+  sl_atr_mult: { enabled: true, values: '0.25, 0.5, 0.75', label: 'SL ATR multiplier', description: 'Stop loss width in ATR units. Run 3 deployed: 0.25', type: 'float' },
+  tp_atr_mult: { enabled: false, values: '4', label: 'TP ATR multiplier (DECORATIVE — locked at 4)', description: 'Run 2 proved TP never binds (trailing exits first). Backend rejects sweeps; pinned at 4 via fixed config.', type: 'float' },
+  rsi_entry_low: { enabled: true, values: '40, 45, 50', label: 'RSI lower bound', description: 'Lower edge of RSI entry zone. Run 3 deployed: 40', type: 'float' },
+  rsi_entry_high: { enabled: true, values: '55, 60', label: 'RSI upper bound', description: 'Upper edge of RSI entry zone. Run 3 deployed: 55', type: 'float' },
+  sma_fast_period: { enabled: false, values: '10, 15, 20', label: 'SMA fast period', description: 'Fast SMA on D1 and H4. Run 3 deployed: 10', type: 'int' },
+  sma_slow_period: { enabled: false, values: '40, 50, 60', label: 'SMA slow period', description: 'Slow SMA on D1 and H4. Run 3 deployed: 60', type: 'int' },
+  vma_period: { enabled: false, values: '15, 20, 25', label: 'VMA period', description: 'Volume MA on H1. Run 3 deployed: 15', type: 'int' },
 };
 
 const METRICS = [
@@ -36,11 +56,16 @@ const METRICS = [
 const BacktestOptimize = () => {
   const toast = useToast();
   const storeAssets = useMarketStore(s => s.assets);
+  const optimizeProgressMap = useMarketStore(s => s.optimizeProgress);
+  const recentEvents = useMarketStore(s => s.recentEvents);
   const [coreAssets, setCoreAssets] = useState<string[]>([]);
   const [allSymbols, setAllSymbols] = useState<string[]>([]);
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
   const [search, setSearch] = useState('');
   const [dateRange, setDateRange] = useState<any>(null);
+  const [history, setHistory] = useState<OptimizeJobMeta[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [viewingHistorical, setViewingHistorical] = useState<string | null>(null);
 
   // Fetch coreAssets directly from REST so the page works even when WS is reconnecting
   useEffect(() => {
@@ -126,6 +151,169 @@ const BacktestOptimize = () => {
     return allSymbols.filter(s => s.toLowerCase().includes(q));
   }, [allSymbols, search]);
 
+  // === Resume in-flight job + history ===
+  // On mount: check localStorage AND backend for running jobs. Restore most recent active.
+  useEffect(() => {
+    const restore = async () => {
+      // Try localStorage first (fastest — same browser)
+      let resumeId = localStorage.getItem(ACTIVE_JOB_KEY);
+
+      // If no localStorage, query backend for any running job (cross-machine resume)
+      if (!resumeId) {
+        try {
+          const r = await fetch(`${API_BASE}/api/jobs?status=running&limit=1`);
+          const d = await r.json();
+          if (d.jobs && d.jobs.length > 0) resumeId = d.jobs[0].id;
+        } catch {}
+      }
+
+      if (!resumeId) return;
+
+      // Fetch full job state
+      try {
+        const r = await fetch(`${API_BASE}/api/jobs/${resumeId}`);
+        const job: OptimizeJobMeta = await r.json();
+        if ((job as any).status === 'not_found') {
+          localStorage.removeItem(ACTIVE_JOB_KEY);
+          return;
+        }
+        if (job.status === 'running' || job.status === 'queued') {
+          // Still in flight — resume
+          setJobId(resumeId);
+          setRunning(true);
+          setProgress({ pct: job.progress.pct, combos_done: 0, combos_total: 0, runs_done: job.progress.runs_done, runs_total: job.progress.runs_total });
+          startPolling(resumeId);
+        } else if (job.status === 'done') {
+          // Finished while we were away — show result
+          setResult(job.result);
+          localStorage.removeItem(ACTIVE_JOB_KEY);
+          toast.show?.('Optimize finished while you were away — showing result', 'success');
+        } else if (job.status === 'failed' || job.status === 'interrupted') {
+          setError(job.error || `Job ${job.status}`);
+          localStorage.removeItem(ACTIVE_JOB_KEY);
+        }
+      } catch (e) {
+        // Backend unreachable — keep id in localStorage, retry on next mount
+      }
+    };
+    restore();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Subscribe to WS optimize progress for the active job (faster than polling)
+  useEffect(() => {
+    if (!jobId) return;
+    const live = optimizeProgressMap[jobId];
+    if (live) {
+      setProgress({
+        pct: live.pct,
+        combos_done: live.combos_done || 0,
+        combos_total: live.combos_total || 0,
+        runs_done: live.runs_done,
+        runs_total: live.runs_total,
+      });
+    }
+  }, [jobId, optimizeProgressMap]);
+
+  // React to OPTIMIZE_DONE event for the active job
+  useEffect(() => {
+    if (!jobId) return;
+    const doneEvent = recentEvents.find(e => e.type === 'OPTIMIZE_DONE' && e.data?.job_id === jobId);
+    if (!doneEvent) return;
+    // Fetch final result
+    fetch(`${API_BASE}/api/jobs/${jobId}`)
+      .then(r => r.json())
+      .then((job: OptimizeJobMeta) => {
+        if (job.status === 'done') setResult(job.result);
+        else if (job.status === 'failed') setError(job.error || 'Job failed');
+        stopPolling();
+        setRunning(false);
+        setJobId(null);
+        localStorage.removeItem(ACTIVE_JOB_KEY);
+        refreshHistory();
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recentEvents, jobId]);
+
+  // Persist + restore jobId via localStorage
+  useEffect(() => {
+    if (jobId) {
+      localStorage.setItem(ACTIVE_JOB_KEY, jobId);
+    } else {
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+    }
+  }, [jobId]);
+
+  const refreshHistory = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/jobs?limit=20`);
+      const d = await r.json();
+      setHistory(d.jobs || []);
+    } catch {}
+  };
+
+  // Load history on mount + when showHistory toggles open
+  useEffect(() => {
+    refreshHistory();
+  }, []);
+
+  useEffect(() => {
+    if (showHistory) refreshHistory();
+  }, [showHistory]);
+
+  const loadHistoricalJob = async (id: string) => {
+    setViewingHistorical(id);
+    try {
+      const r = await fetch(`${API_BASE}/api/jobs/${id}`);
+      const job: OptimizeJobMeta = await r.json();
+      if (job.status === 'done' && job.result) {
+        setResult(job.result);
+        setError(null);
+        setShowHistory(false);
+        toast.show?.(`Loaded historical job ${id.slice(0, 8)} (${job.status})`, 'info');
+      } else {
+        toast.show?.(`Job is ${job.status} — no result to display`, 'error');
+      }
+    } catch (e) {
+      toast.show?.('Failed to load historical job', 'error');
+    } finally {
+      setViewingHistorical(null);
+    }
+  };
+
+  const startPolling = (id: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const jr = await fetch(`${API_BASE}/api/jobs/${id}`);
+        const job: OptimizeJobMeta = await jr.json();
+        if ((job as any).status === 'not_found') {
+          setError('Job was lost. Re-run.');
+          stopPolling();
+          setRunning(false);
+          setJobId(null);
+          return;
+        }
+        if (job.progress) setProgress({ pct: job.progress.pct, combos_done: 0, combos_total: 0, runs_done: job.progress.runs_done, runs_total: job.progress.runs_total });
+        if (job.status === 'done') {
+          setResult(job.result);
+          stopPolling();
+          setRunning(false);
+          setJobId(null);
+          refreshHistory();
+        } else if (job.status === 'failed' || job.status === 'interrupted') {
+          setError(job.error || `Job ${job.status}`);
+          stopPolling();
+          setRunning(false);
+          setJobId(null);
+          refreshHistory();
+        }
+      } catch {
+        // Backend likely restarting — keep polling
+      }
+    }, 2000);
+  };
+
   const parseValues = (str: string, type: 'float' | 'int'): number[] => {
     return str.split(/[,\s]+/).map(s => s.trim()).filter(Boolean).map(s => type === 'int' ? parseInt(s) : parseFloat(s)).filter(n => !isNaN(n));
   };
@@ -185,15 +373,30 @@ const BacktestOptimize = () => {
     setProgress({ pct: 0, combos_done: 0, combos_total: 0, runs_done: 0, runs_total: 0 });
 
     const sweepsPayload: Record<string, number[]> = {};
+    const fixedPayload: Record<string, number> = {
+      risk_percent: parseFloat(riskPercent),
+      spread_pips: parseFloat(spreadPips),
+      slippage_pips: parseFloat(slippagePips),
+      starting_equity: parseFloat(startingEquity),
+    };
+
+    // Backend rejects tp_atr_mult in sweeps (TP is decorative — Run 2 finding).
+    // Auto-move it to `fixed` so users who enable the row don't get a 422.
+    // Also strip empty arrays.
     for (const [key, sc] of Object.entries(sweeps)) {
       if (!sc.enabled) continue;
       const vals = parseValues(sc.values, sc.type);
       if (vals.length === 0) continue;
+      if (key === 'tp_atr_mult') {
+        // Pin to first value (or 4 if multiple — TP is decorative anyway)
+        fixedPayload['tp_atr_mult'] = vals.length === 1 ? vals[0] : 4.0;
+        continue;
+      }
       sweepsPayload[key] = vals;
     }
 
     if (Object.keys(sweepsPayload).length === 0) {
-      setError('Enable at least one sweep parameter.');
+      setError('Enable at least one sweep parameter (other than TP, which is decorative).');
       setRunning(false);
       setProgress(null);
       return;
@@ -208,12 +411,7 @@ const BacktestOptimize = () => {
           start_date: startDate,
           end_date: endDate,
           sweeps: sweepsPayload,
-          fixed: {
-            risk_percent: parseFloat(riskPercent),
-            spread_pips: parseFloat(spreadPips),
-            slippage_pips: parseFloat(slippagePips),
-            starting_equity: parseFloat(startingEquity),
-          },
+          fixed: fixedPayload,
           rank_by: rankBy,
           top_n: parseInt(topN),
           require_min_trades: parseInt(minTrades),
@@ -222,43 +420,27 @@ const BacktestOptimize = () => {
         }),
       });
       const d = await r.json();
-      if (d.ok === false || !d.job_id) {
-        setError(d.error || 'Optimize submission failed');
+      if (!r.ok || d.ok === false || !d.job_id) {
+        // FastAPI 422 returns { detail: [{ msg: "...", loc: [...] }] }
+        // FastAPI 500 / our explicit errors return { error: "..." } or { ok: false, error: "..." }
+        let msg = 'Optimize submission failed';
+        if (Array.isArray(d.detail) && d.detail.length > 0) {
+          msg = d.detail.map((x: any) => x.msg || JSON.stringify(x)).join(' · ');
+        } else if (typeof d.detail === 'string') {
+          msg = d.detail;
+        } else if (d.error) {
+          msg = d.error;
+        }
+        setError(`${msg} (HTTP ${r.status})`);
         setRunning(false);
         setProgress(null);
         return;
       }
       setJobId(d.job_id);
-
-      // Start polling
-      pollRef.current = setInterval(async () => {
-        try {
-          const jr = await fetch(`${API_BASE}/api/jobs/${d.job_id}`);
-          const job = await jr.json();
-          if (job.status === 'not_found') {
-            setError('Job was lost (backend restarted?). Re-run.');
-            stopPolling();
-            setRunning(false);
-            return;
-          }
-          if (job.progress) setProgress(job.progress);
-          if (job.status === 'done') {
-            setResult(job.result);
-            stopPolling();
-            setRunning(false);
-            setJobId(null);
-          } else if (job.status === 'failed') {
-            setError(job.error || 'Job failed');
-            stopPolling();
-            setRunning(false);
-            setJobId(null);
-          }
-        } catch (e) {
-          // Backend likely restarting — keep polling, exponential might be nicer but keep simple
-        }
-      }, 1000);
+      // Polling at 2s as fallback — WS OPTIMIZE_PROGRESS handles main updates faster
+      startPolling(d.job_id);
     } catch (e: any) {
-      setError(String(e));
+      setError(`Network error: ${String(e)}`);
       setRunning(false);
       setProgress(null);
     }
@@ -622,7 +804,99 @@ const BacktestOptimize = () => {
               Cancel
             </button>
           )}
+          <button
+            onClick={() => setShowHistory(v => !v)}
+            className="bg-surfaceLight hover:bg-surface border border-surfaceLight text-text px-4 py-3 rounded-lg font-semibold flex items-center gap-2 ml-auto"
+            title="View past optimization runs"
+          >
+            <History size={16} />
+            History {history.length > 0 && <span className="bg-primary/30 text-primary text-xs px-1.5 py-0.5 rounded">{history.length}</span>}
+          </button>
         </div>
+
+        {/* Job History panel */}
+        {showHistory && (
+          <div className="mt-4 bg-background border border-surfaceLight rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <History size={16} className="text-primary" />
+                <h4 className="font-semibold text-sm">Optimization History (last 20)</h4>
+              </div>
+              <button onClick={refreshHistory} className="text-xs text-textMuted hover:text-text">Refresh</button>
+            </div>
+            {history.length === 0 ? (
+              <div className="text-textMuted text-sm text-center py-4">No past optimizations yet</div>
+            ) : (
+              <div className="overflow-x-auto custom-scrollbar">
+                <table className="w-full text-xs">
+                  <thead className="text-textMuted border-b border-surfaceLight">
+                    <tr>
+                      <th className="text-left py-2 px-2 font-semibold">When</th>
+                      <th className="text-left py-2 px-2 font-semibold">Status</th>
+                      <th className="text-left py-2 px-2 font-semibold">Symbols</th>
+                      <th className="text-left py-2 px-2 font-semibold">Window</th>
+                      <th className="text-right py-2 px-2 font-semibold">Progress</th>
+                      <th className="text-right py-2 px-2 font-semibold">Duration</th>
+                      <th className="text-left py-2 px-2 font-semibold">Source</th>
+                      <th className="text-right py-2 px-2 font-semibold">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {history.map(job => {
+                      const isActive = jobId === job.id;
+                      const sym = (job.config?.symbols || []).join(',').slice(0, 30);
+                      const win = job.config ? `${job.config.start_date} → ${job.config.end_date}` : '—';
+                      const dur = job.duration_seconds ? `${job.duration_seconds.toFixed(0)}s` : (job.status === 'running' ? 'running...' : '—');
+                      return (
+                        <tr key={job.id} className={`border-b border-surfaceLight/40 ${isActive ? 'bg-primary/10' : 'hover:bg-surfaceLight/30'}`}>
+                          <td className="py-2 px-2 font-mono text-[10px]">
+                            <Clock size={10} className="inline mr-1 opacity-60" />
+                            {new Date(job.created_at).toLocaleString()}
+                          </td>
+                          <td className="py-2 px-2">
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              job.status === 'done' ? 'bg-success/20 text-success' :
+                              job.status === 'running' ? 'bg-warning/20 text-warning' :
+                              job.status === 'queued' ? 'bg-textMuted/20 text-textMuted' :
+                              job.status === 'failed' ? 'bg-danger/20 text-danger' :
+                              'bg-surfaceLight text-textMuted'
+                            }`}>
+                              {job.status}
+                            </span>
+                          </td>
+                          <td className="py-2 px-2 font-mono text-[10px] truncate max-w-[180px]" title={sym}>{sym || '—'}</td>
+                          <td className="py-2 px-2 font-mono text-[10px]">{win}</td>
+                          <td className="py-2 px-2 text-right font-mono">{job.progress?.pct?.toFixed(0) || 0}%</td>
+                          <td className="py-2 px-2 text-right font-mono">{dur}</td>
+                          <td className="py-2 px-2 text-[10px]">
+                            <span className={`px-1.5 py-0.5 rounded ${job.triggered_by === 'auto_cron' ? 'bg-primary/20 text-primary' : 'bg-surfaceLight'}`}>
+                              {job.triggered_by}
+                            </span>
+                          </td>
+                          <td className="py-2 px-2 text-right">
+                            {job.has_result ? (
+                              <button
+                                onClick={() => loadHistoricalJob(job.id)}
+                                disabled={viewingHistorical === job.id}
+                                className="text-primary hover:underline disabled:opacity-50 text-[10px] font-semibold"
+                              >
+                                {viewingHistorical === job.id ? 'Loading...' : 'View'}
+                              </button>
+                            ) : isActive ? (
+                              <span className="text-warning text-[10px]">Active</span>
+                            ) : (
+                              <span className="text-textMuted text-[10px]">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Live progress */}
         {running && progress && (

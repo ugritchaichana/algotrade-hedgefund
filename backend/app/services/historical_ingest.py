@@ -171,7 +171,20 @@ def deep_backfill_timeframe(symbol: str, tf_str: str, count: int | None = None) 
     resolved = resolve_symbol(symbol)
     db = SessionLocal()
     try:
+        # IUX (and many CFD brokers) cap M1 history depth — requesting 300k often returns nothing
+        # because broker can't satisfy. Try progressively smaller counts until something returns.
         rates = mt5.copy_rates_from_pos(resolved, tf_const, 0, target_count)
+        if (rates is None or len(rates) == 0) and target_count > 50000:
+            # Fallback chain — 300k → 100k → 50k → 20k → 5k
+            for fallback_count in [100000, 50000, 20000, 5000]:
+                if fallback_count >= target_count:
+                    continue
+                log.info("deep_backfill %s %s: %d returned empty, trying %d",
+                         symbol, tf_str, target_count, fallback_count)
+                rates = mt5.copy_rates_from_pos(resolved, tf_const, 0, fallback_count)
+                if rates is not None and len(rates) > 0:
+                    target_count = fallback_count
+                    break
         if rates is None or len(rates) == 0:
             return {"ok": True, "symbol": symbol, "timeframe": tf_str, "fetched": 0, "inserted": 0, "reason": "broker_returned_empty"}
 

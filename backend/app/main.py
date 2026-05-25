@@ -327,40 +327,62 @@ _job_runtime: dict[str, dict] = {}
 def _tracked(job_id: str):
     """Decorator factory: wrap a scheduled job target so its last execution timestamp +
     last error (if any) are recorded for /api/health/deep visibility. HEALTH_DELTA is
-    broadcast only when status flips (ok->error or error->ok) to avoid noise."""
-    def deco(fn):
-        def wrapper(*args, **kwargs):
-            started = datetime.datetime.utcnow().isoformat()
-            prev_status = _job_runtime.get(job_id, {}).get("last_status")
+    broadcast only when status flips (ok->error or error->ok) to avoid noise.
+
+    Async-aware: if `fn` is a coroutine function, returns an async wrapper that awaits
+    it. APScheduler accepts both sync and async callables; the wrapper must match.
+
+    BUG FIX 2026-05-26 (FIX8): previous sync-only wrapper returned a coroutine without
+    awaiting it when wrapping async functions like `broadcast_tick_data`, silently
+    breaking WS TICK_DATA broadcasts. Detect via `asyncio.iscoroutinefunction`.
+    """
+    import asyncio as _asyncio
+
+    def _record_ok(started: str, prev_status: str | None):
+        _job_runtime[job_id] = {"last_run": started, "last_error": None, "last_status": "ok"}
+        if prev_status == "error":
             try:
-                result = fn(*args, **kwargs)
-                _job_runtime[job_id] = {
-                    "last_run": started,
-                    "last_error": None,
-                    "last_status": "ok",
-                }
-                if prev_status == "error":
-                    try:
-                        from app.core.events import broadcast_event
-                        broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "ok", "last_run": started})
-                    except Exception:
-                        pass
-                return result
-            except Exception as e:
-                _job_runtime[job_id] = {
-                    "last_run": started,
-                    "last_error": str(e)[:300],
-                    "last_status": "error",
-                }
-                if prev_status != "error":
-                    try:
-                        from app.core.events import broadcast_event
-                        broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "error", "last_error": str(e)[:300], "last_run": started})
-                    except Exception:
-                        pass
-                raise
-        wrapper.__name__ = fn.__name__
-        return wrapper
+                from app.core.events import broadcast_event
+                broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "ok", "last_run": started})
+            except Exception:
+                pass
+
+    def _record_err(started: str, prev_status: str | None, e: Exception):
+        _job_runtime[job_id] = {"last_run": started, "last_error": str(e)[:300], "last_status": "error"}
+        if prev_status != "error":
+            try:
+                from app.core.events import broadcast_event
+                broadcast_event("HEALTH_DELTA", {"job_id": job_id, "last_status": "error", "last_error": str(e)[:300], "last_run": started})
+            except Exception:
+                pass
+
+    def deco(fn):
+        if _asyncio.iscoroutinefunction(fn):
+            async def async_wrapper(*args, **kwargs):
+                started = datetime.datetime.utcnow().isoformat()
+                prev_status = _job_runtime.get(job_id, {}).get("last_status")
+                try:
+                    result = await fn(*args, **kwargs)
+                    _record_ok(started, prev_status)
+                    return result
+                except Exception as e:
+                    _record_err(started, prev_status, e)
+                    raise
+            async_wrapper.__name__ = fn.__name__
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                started = datetime.datetime.utcnow().isoformat()
+                prev_status = _job_runtime.get(job_id, {}).get("last_status")
+                try:
+                    result = fn(*args, **kwargs)
+                    _record_ok(started, prev_status)
+                    return result
+                except Exception as e:
+                    _record_err(started, prev_status, e)
+                    raise
+            sync_wrapper.__name__ = fn.__name__
+            return sync_wrapper
     return deco
 
 
@@ -1028,27 +1050,39 @@ def journal_list(days: int = 30, symbol: str | None = None, side: str | None = N
 
 
 # Edge vs Noise classification — decisive Phase 2 demo decision tool.
-# Edge = strategy thesis worked: PARTIAL_TP + TRAIL_SL after stage 3+ + TP
-# Noise = exit didn't pass through trailing logic: initial SL + early TRAIL_SL (stage 1 or 2)
-_EDGE_REASONS = {"PARTIAL_TP", "TP", "Take Profit"}
-_NOISE_REASONS = {"SL", "Stop Loss", "Manual Close"}
+# Edge = strategy thesis worked: trade exit happened AFTER trailing locked at least 1.5R
+# Noise = stopped before trail engaged (initial SL with low/negative R)
+#
+# IMPORTANT: trade_manager._process_closed_trade maps MT5 DEAL_REASON to plain strings:
+#   DEAL_REASON_SL     -> "Stop Loss"      (could be INITIAL SL = noise, OR trailed SL = edge!)
+#   DEAL_REASON_TP     -> "Take Profit"    (always edge — only fires if TP price hit)
+#   DEAL_REASON_CLIENT -> "Manual Close"   (mixed — user intervention)
+#   default            -> "Manual/Trail"   (system trail exit OR broker-other)
+#
+# A "Stop Loss" exit at r_multiple >= 1.5 is a TRAILED stop-out (edge), not initial-SL noise.
+# Classifier MUST use r_multiple to disambiguate, not just the reason string.
+_EDGE_REASONS_STRICT = {"PARTIAL_TP", "TP", "Take Profit"}
+_AMBIGUOUS_SL_REASONS = {"SL", "Stop Loss", "TRAIL_SL", "Trail SL", "Manual/Trail"}
+_MIXED_REASONS = {"Manual Close"}
 
 
 def _classify_attribution(exit_reason: str | None, r_multiple: float | None) -> str:
-    """Bucket each trade into 'edge', 'noise', or 'mixed'.
+    """Bucket each trade into 'edge', 'noise', 'mixed', or 'open'.
 
-    Edge = thesis trades (partial close hit OR full TP hit OR trail-out at >= 2R).
-    Noise = stopped out before trail had time to advance (initial SL or low-R close).
-    Mixed = late-stage trail exits (manual / unclear / system close)."""
+    Edge = thesis trades: partial close, full TP, OR SL hit at r >= 1.5 (trailed-out)
+    Noise = early stop-out: SL hit at r < 1.5 (trail didn't engage)
+    Mixed = manual intervention (user closed before exit logic could play out)
+    """
     if exit_reason is None:
         return "open"
     er = (exit_reason or "").strip()
-    if er in _EDGE_REASONS:
+    if er in _EDGE_REASONS_STRICT:
         return "edge"
-    if er.startswith("TRAIL_SL") or er == "Trail SL":
+    if er in _MIXED_REASONS:
+        return "mixed"
+    if er in _AMBIGUOUS_SL_REASONS or er.startswith("TRAIL_SL"):
+        # SL reason — decide via r_multiple: >= 1.5 = trail-out (edge), else noise
         return "edge" if (r_multiple or 0) >= 1.5 else "noise"
-    if er in _NOISE_REASONS:
-        return "noise"
     return "mixed"
 
 
@@ -1283,7 +1317,8 @@ def mt5_history(symbol: str, timeframe: str = "H1", count: int = 500):
         "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
         "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
         "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
-        "D1": mt5.TIMEFRAME_D1,
+        "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1,
+        "MN1": mt5.TIMEFRAME_MN1,
     }
     tf = tf_map.get(timeframe, mt5.TIMEFRAME_H1)
     return {"symbol": symbol, "data": get_chart_data(symbol, tf, count)}
@@ -1297,11 +1332,15 @@ def historical_status():
 
 
 @app.get("/api/historical/date-range")
-def historical_date_range(symbols: str = "", db: Session = Depends(get_db)):
+def historical_date_range(symbols: str = "", start_date: str | None = None,
+                          end_date: str | None = None, db: Session = Depends(get_db)):
     """Return the date range available for each symbol AND the intersection across symbols.
 
     Args (query):
         symbols: comma-separated list. Empty or 'ALL' = all configured core_assets.
+        start_date, end_date: optional ISO YYYY-MM-DD. When provided, also classify
+            symbols as 'partial' (data exists but doesn't cover requested window)
+            in addition to 'no data at all' / 'missing timeframes'.
 
     The intersection is the most-recent of the per-symbol first-dates and the
     earliest of the per-symbol last-dates. Used by the frontend calendar to
@@ -1345,6 +1384,20 @@ def historical_date_range(symbols: str = "", db: Session = Depends(get_db)):
     fully_ready: list[str] = []
     not_ready: list[dict] = []
 
+    # Parse optional window bounds for partial-coverage detection
+    win_start = None
+    win_end = None
+    if start_date:
+        try:
+            win_start = datetime.datetime.fromisoformat(start_date)
+        except Exception:
+            pass
+    if end_date:
+        try:
+            win_end = datetime.datetime.fromisoformat(end_date)
+        except Exception:
+            pass
+
     for sym in sym_list:
         if sym not in per_symbol:
             not_ready.append({"symbol": sym, "reason": "no data at all"})
@@ -1363,6 +1416,21 @@ def historical_date_range(symbols: str = "", db: Session = Depends(get_db)):
         )
         per_symbol[sym]["first"] = symbol_first.isoformat()
         per_symbol[sym]["last"] = symbol_last.isoformat()
+
+        # Partial-coverage check against requested window — only when bounds provided
+        if win_start and symbol_first > win_start:
+            not_ready.append({
+                "symbol": sym,
+                "reason": f"data starts {symbol_first.date()} (after requested {win_start.date()})"
+            })
+            continue
+        if win_end and symbol_last < win_end:
+            not_ready.append({
+                "symbol": sym,
+                "reason": f"data ends {symbol_last.date()} (before requested {win_end.date()})"
+            })
+            continue
+
         fully_ready.append(sym)
         if intersect_first is None or symbol_first > intersect_first:
             intersect_first = symbol_first
@@ -1390,14 +1458,22 @@ def historical_ingest_now():
     return summary
 
 
-@app.post("/api/historical/deep-backfill")
-async def historical_deep_backfill():
-    """Force-fetch the full INITIAL_BACKFILL window (5000 candles per TF) regardless of existing rows.
+class DeepBackfillRequest(BaseModel):
+    symbols: list[str] | None = None    # None = use core_assets
+    timeframes: list[str] | None = None  # None = ["D1", "H4", "H1"] default
 
-    Use this AFTER raising INITIAL_BACKFILL to deepen history. Runs in a thread so it doesn't
-    block the event loop — large symbol universes take 30-90s.
+
+@app.post("/api/historical/deep-backfill")
+async def historical_deep_backfill(req: DeepBackfillRequest | None = None):
+    """Force-fetch the full INITIAL_BACKFILL window (5000 candles per TF, 300k for M1).
+
+    Pass `symbols` + `timeframes` in body to scope (e.g. {"symbols":["BTCUSD"], "timeframes":["M1"]}).
+    Defaults to all core_assets × D1/H4/H1. Runs in a thread so the event loop keeps pumping —
+    large universe x M1 takes 5-15 min depending on broker history depth.
     """
-    return await asyncio.to_thread(deep_backfill_all, get_core_assets())
+    syms = req.symbols if (req and req.symbols) else get_core_assets()
+    tfs = req.timeframes if (req and req.timeframes) else None  # service uses default
+    return await asyncio.to_thread(deep_backfill_all, syms, tfs)
 
 
 @app.get("/api/historical/{symbol}")
@@ -1788,6 +1864,24 @@ async def settings_update(payload: SettingUpdate, db: Session = Depends(get_db))
         pass
 
     return {"status": "success", "key": payload.key, "value": payload.value}
+
+
+@app.delete("/api/settings/{key}")
+def settings_delete(key: str, db: Session = Depends(get_db)):
+    """Delete a settings row. Used for test cleanup + UI 'reset to default'."""
+    row = db.query(SystemSettings).filter(SystemSettings.key == key).first()
+    if not row:
+        return {"status": "not_found", "key": key}
+    db.delete(row)
+    db.commit()
+    log_action("System", "Settings Delete", key)
+    invalidate_settings_cache()
+    try:
+        from app.core.events import broadcast_event
+        broadcast_event("SETTING_CHANGED", {"key": key, "value": None, "deleted": True})
+    except Exception:
+        pass
+    return {"status": "deleted", "key": key}
 
 
 @app.post("/api/settings/reset-assets")

@@ -68,7 +68,11 @@ const BacktestRun = () => {
       return;
     }
     setLoadingRange(true);
-    fetch(`${API_BASE}/api/historical/date-range?symbols=${selectedSymbols.join(',')}`)
+    // Pass selected window so backend can detect partial coverage, not just no-data.
+    const winParams = (startDate && endDate)
+      ? `&start_date=${startDate}&end_date=${endDate}`
+      : '';
+    fetch(`${API_BASE}/api/historical/date-range?symbols=${selectedSymbols.join(',')}${winParams}`)
       .then(r => r.json())
       .then(d => {
         if (d.ok) {
@@ -89,7 +93,7 @@ const BacktestRun = () => {
       })
       .catch(() => setDateRange(null))
       .finally(() => setLoadingRange(false));
-  }, [selectedSymbols.join(',')]);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedSymbols.join(','), startDate, endDate]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Render equity curve (single-symbol only — multi shows per-symbol table instead)
   useEffect(() => {

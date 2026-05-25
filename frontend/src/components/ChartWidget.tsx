@@ -4,13 +4,25 @@ import { API_BASE } from '../lib/api';
 
 interface ChartWidgetProps {
   symbol: string;
+  timeframe?: string;     // M5, M15, H1, H4, D1, W1, MN1 — default H1
   entry?: number;
   sl?: number;
   tp?: number;
   signal?: string;
+  height?: number | string;  // CSS height — default fills container
+  count?: number;         // candles to fetch — default 500
 }
 
-const ChartWidget: React.FC<ChartWidgetProps> = ({ symbol, entry, sl, tp, signal }) => {
+const ChartWidget: React.FC<ChartWidgetProps> = ({
+  symbol,
+  timeframe = 'H1',
+  entry,
+  sl,
+  tp,
+  signal,
+  height,
+  count = 500,
+}) => {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<any>(null);
   const seriesRef = useRef<any>(null);
@@ -18,7 +30,6 @@ const ChartWidget: React.FC<ChartWidgetProps> = ({ symbol, entry, sl, tp, signal
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
-    // Create chart
     const chart = createChart(chartContainerRef.current, {
       layout: {
         background: { type: 'solid' as any, color: '#131722' },
@@ -28,22 +39,18 @@ const ChartWidget: React.FC<ChartWidgetProps> = ({ symbol, entry, sl, tp, signal
         vertLines: { color: 'rgba(42, 46, 57, 0.5)' },
         horzLines: { color: 'rgba(42, 46, 57, 0.5)' },
       },
-      crosshair: {
-        mode: CrosshairMode.Normal,
-      },
-      rightPriceScale: {
-        borderColor: 'rgba(197, 203, 206, 0.8)',
-      },
+      crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { borderColor: 'rgba(197, 203, 206, 0.8)' },
       timeScale: {
         borderColor: 'rgba(197, 203, 206, 0.8)',
-        timeVisible: true,
+        timeVisible: timeframe !== 'D1' && timeframe !== 'W1' && timeframe !== 'MN1',
         secondsVisible: false,
       },
+      autoSize: !height,  // when no explicit height, fill container responsively
     });
 
     chartRef.current = chart;
 
-    // Create Candlestick Series (v5 API)
     const candlestickSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#26a69a',
       downColor: '#ef5350',
@@ -54,67 +61,52 @@ const ChartWidget: React.FC<ChartWidgetProps> = ({ symbol, entry, sl, tp, signal
 
     seriesRef.current = candlestickSeries;
 
-    // Fetch Historical Data
-    fetch(`${API_BASE}/api/mt5/history/${symbol}?timeframe=H1&count=500`)
+    let cancelled = false;
+    fetch(`${API_BASE}/api/mt5/history/${symbol}?timeframe=${timeframe}&count=${count}`)
       .then(res => res.json())
       .then(data => {
+        if (cancelled) return;
         if (data.data && data.data.length > 0) {
           candlestickSeries.setData(data.data);
-          
-          // Add Order Lines if available
+
           if (entry && sl && tp && signal && signal.startsWith('ENTRY')) {
-            // Entry Line
             candlestickSeries.createPriceLine({
-              price: entry,
-              color: '#2962FF',
-              lineWidth: 2,
-              lineStyle: LineStyle.Solid,
-              axisLabelVisible: true,
-              title: 'ENTRY',
+              price: entry, color: '#2962FF', lineWidth: 2,
+              lineStyle: LineStyle.Solid, axisLabelVisible: true, title: 'ENTRY',
             });
-
-            // Stop Loss Line
             candlestickSeries.createPriceLine({
-              price: sl,
-              color: '#ef5350',
-              lineWidth: 2,
-              lineStyle: LineStyle.Dashed,
-              axisLabelVisible: true,
-              title: 'SL',
+              price: sl, color: '#ef5350', lineWidth: 2,
+              lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'SL',
             });
-
-            // Take Profit Line
             candlestickSeries.createPriceLine({
-              price: tp,
-              color: '#26a69a',
-              lineWidth: 2,
-              lineStyle: LineStyle.Dashed,
-              axisLabelVisible: true,
-              title: 'TP',
+              price: tp, color: '#26a69a', lineWidth: 2,
+              lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'TP',
             });
           }
+          chart.timeScale().fitContent();
         }
       })
-      .catch(err => console.error("Error fetching chart data:", err));
+      .catch(err => console.error('Chart fetch failed:', err));
 
-    // Handle Resize
     const handleResize = () => {
       if (chartContainerRef.current) {
         chart.applyOptions({ width: chartContainerRef.current.clientWidth });
       }
     };
-
     window.addEventListener('resize', handleResize);
 
     return () => {
+      cancelled = true;
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [symbol, entry, sl, tp, signal]);
+  }, [symbol, timeframe, entry, sl, tp, signal, count]);
 
-  return (
-    <div className="w-full h-[400px]" ref={chartContainerRef} />
-  );
+  const style: React.CSSProperties = height
+    ? { height: typeof height === 'number' ? `${height}px` : height, width: '100%' }
+    : { height: '100%', width: '100%' };
+
+  return <div className="w-full" style={style} ref={chartContainerRef} />;
 };
 
 export default ChartWidget;

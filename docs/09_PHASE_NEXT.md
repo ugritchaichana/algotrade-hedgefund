@@ -1,11 +1,126 @@
 # Phase Next — Roadmap Delta after 2026-05-26 push
 
 Drafted: 2026-05-26 after the major Phase D/F/G push.
+Updated: 2026-05-26 (later same session) after bug-fix wave + 2 UI overhauls.
 
 This doc captures (a) what just landed, (b) what still needs decisions, (c) the path
 forward Phase-by-Phase. It supplements `docs/00_ROADMAP.md` (the 9-phase canonical doc).
 
 ---
+
+## Third batch — Bug-fix wave + UI redesigns (2026-05-26 evening)
+
+Came AFTER Phase D/F/G committed (`2cbfc8b`). Triggered by user screenshots + runtime
+log showing "Optimize submission failed". 10 bugs + 2 UI overhauls.
+
+### Bugs fixed (10)
+
+| ID | Symptom | Root cause | Fix |
+|---|---|---|---|
+| FIX1 | Trade Journal NAS100 exit_price = 52.58 (impossible — that's LTCUSD's last price) | `mt5.history_deals_get(..., position=ticket)` keyword filter unreliable on some MT5 builds → returns all deals → `out_deals[-1]` is global most-recent | Re-filter in Python: `getattr(d, "position_id", None) == trade.ticket` |
+| FIX2 | Optimize reported OOS PF 634 (impossibly high) | `_cost` accepted `actual_spread_points=0` as valid → cost=0 → PF = gross/0 = infinite | Treat `<=0` as missing → fallback to flat `spread_pips` parameter |
+| FIX3 | EURUSD "no data at all" warning despite Data Status showing 5000 H1 | `/api/historical/date-range` only checked "has any row" — didn't compare against requested backtest window | Added `start_date`+`end_date` params; partial coverage now reports "data ends YYYY-MM-DD (before requested YYYY-MM-DD)" |
+| FIX4 | Execution Desk "Recent Closed Deals" empty despite journal having 3 closed trades | Page read from `accountStatus.recent_history` (MT5 native field, often unreliable) | Switched to `GET /api/journal?days=7` + auto-refresh on `TRADE_CLOSED` WS event |
+| FIX5 | Data Status table missing M1 column + M1 ingest returned 0 candles | (a) frontend `timeframes` array missing 'M1', (b) broker rejected `count=300000` request silently | (a) Added M1 to table, (b) `deep_backfill_timeframe` fallback chain 300k → 100k → 50k → 20k → 5k. BTCUSD M1 = 50000 candles confirmed |
+| FIX6 | `api_test_probe_value` from API test polluting Settings UI + Activity Feed | Test didn't clean up | New `DELETE /api/settings/{key}` endpoint + test teardown in `finally:` block |
+| FIX7 | Edge/Noise classifier counted trail-out stops as noise | `_classify_attribution` only matched literal `"TRAIL_SL"`/`"Trail SL"` strings, but `trade_manager` sets exit_reason to MT5 DEAL_REASON → "Stop Loss" for any SL hit (initial OR trailed) | Classifier now uses `r_multiple >= 1.5` to distinguish trail-out from initial-SL on any SL-family reason |
+| **FIX8 CRITICAL** | (Silent — caught only via runtime log: `RuntimeWarning: coroutine 'broadcast_tick_data' was never awaited`) | `_tracked` decorator wrapped async functions with sync wrapper → coroutine returned, never awaited → WS TICK_DATA broadcasts dead since commit `2cbfc8b` | Detect async via `asyncio.iscoroutinefunction` → return async wrapper that awaits |
+| FIX9 | Optimize page lost state on browser tab close/refresh + no way to view past results | Component state only — no persistence | localStorage persist `algotrade_active_optimize_job` + on-mount restore (from localStorage AND backend `/api/jobs?status=running`) + WS subscribe to `optimizeProgress` slice + History panel with last 20 jobs |
+| FIX10 | "Optimize submission failed" — generic error on every default Run click | (a) Default `tp_atr_mult.enabled=true` but backend validator rejects (added in `2cbfc8b` T3#14), (b) frontend didn't parse FastAPI 422 `detail[].msg` | (a) Default disabled + label updated, (b) auto-move enabled `tp_atr_mult` to `fixed`, (c) error display parses `detail[].msg` |
+
+### UI overhauls (2)
+
+**UI #1 — Quant Screener expand row (first attempt):**
+Replaced the narrow 25% Trade Details column with 4-card grid: Triple Screen Alignment
+chips (D1/H4/H1 with trend icons + ALIGNED badge), RSI gauge with zone markers
+(0-30 oversold, 40-55 entry, 70-100 overbought) + needle at current value, Volume vs
+VMA with ratio bar, Execution Plan (Entry/SL/TP boxes + R/R + Lot + Risk%), Reasoning
+(Technical + Macro). Live Price card with bid/ask/OPEN-CLOSED/spread/last-tick-age.
+
+**UI #2 — Quant Screener TradingView layout (superseded #1):**
+Discarded expand-row pattern. Two-pane layout:
+- LEFT (large): Symbol header (bid/ask/OPEN/CLOSED/signal) + Live Chart + Detail cards below
+- RIGHT (320px sticky): Watchlist sidebar — search input + filter dropdown + scrollable list
+  with sparkline, signal badge, RSI mini, POS indicator
+
+**Timeframe selector** above chart: M5 / M15 / H1 / H4 / D / W (6 TFs).
+
+`ChartWidget` extended:
+- accepts `timeframe` prop (default H1)
+- accepts `height` prop (default fills parent via `autoSize`)
+- backend `mt5_history` endpoint adds `W1` + `MN1` to `tf_map`
+- `cancelled` flag in fetch effect prevents stale-data race
+
+**Persistence**: selected symbol + timeframe stored in localStorage:
+- `algotrade_selected_symbol`
+- `algotrade_chart_timeframe`
+
+Reload page → restored.
+
+### Tests added/extended
+
+| Suite | Cases | Type |
+|---|---|---|
+| `test_attribution_classify.py` | 8 → 10 | FIX7 — stop-loss-at-high-r is edge + manual-trail-default-classified-via-r |
+| `test_spread_aware_cost.py` | 4 → 6 | FIX2 — zero + negative spread fallback |
+| `test_api_endpoints.py` | NEW 28 + 5 heavy | Live API smoke (auth, health, settings, journal, attribution, equity, jobs, MT5 proxy, historical) + heavy (kill-switch, backtest_run, optimize_queue, deep-backfill, reflection) |
+| Backend pytest total | **67** + 5 heavy | up from 35 |
+| `frontend/tests/e2e/*` | 16 spec files (NEW) | auth, theme, command_palette, activity_feed, kill_switch, dashboard, navigation, quant_screener (8 cases for TradingView layout), execution_desk, equity_curve, trade_journal, system_health, backtest_data, backtest_run, backtest_optimize, settings |
+| Frontend E2E total | **85** | with auth fixture (`pre-inject PIN + theme via localStorage`) |
+| Frontend Vite build | 288kb gzipped | OK |
+
+### Files in third batch
+
+```
+M backend/app/main.py
+   — /api/historical/date-range adds start_date+end_date partial-coverage check (FIX3)
+   — DELETE /api/settings/{key} endpoint (FIX6)
+   — _classify_attribution uses r_multiple for SL-family reasons (FIX7)
+   — _tracked decorator async-aware via asyncio.iscoroutinefunction (FIX8)
+   — POST /api/historical/deep-backfill accepts {symbols, timeframes} body (FIX5)
+   — mt5_history tf_map adds W1 + MN1 (UI #2)
+M backend/app/services/backtest_engine.py
+   — _cost treats actual_spread_points<=0 as missing fallback (FIX2)
+M backend/app/services/historical_ingest.py
+   — deep_backfill_timeframe fallback chain when broker returns empty (FIX5)
+M backend/app/services/trade_manager.py
+   — _process_closed_trade re-filters by position_id in Python (FIX1)
+M backend/pytest.ini
+   — heavy marker registered, default addopts excludes heavy
+A backend/tests/test_api_endpoints.py
+   — 28 covered endpoints + 5 heavy
+M backend/tests/test_attribution_classify.py  (FIX7 + 2 regression)
+M backend/tests/test_spread_aware_cost.py     (FIX2 + 2 regression)
+M frontend/package.json
+   — test:e2e uses @playwright/test cli directly (avoid CT collision)
+M frontend/src/components/ChartWidget.tsx
+   — accepts timeframe + height + count props, cancelled flag in fetch
+M frontend/src/pages/BacktestDataStatus.tsx       (M1 column — FIX5)
+M frontend/src/pages/BacktestOptimize.tsx
+   — localStorage active job persistence (FIX9)
+   — on-mount restore from localStorage AND backend (FIX9)
+   — WS optimizeProgress subscription + OPTIMIZE_DONE handler (FIX9)
+   — History panel with last 20 jobs (FIX9)
+   — DEFAULT_SWEEPS.tp_atr_mult.enabled = false (FIX10)
+   — auto-move enabled tp_atr_mult to fixed (FIX10)
+   — parse FastAPI 422 detail[].msg in error display (FIX10)
+M frontend/src/pages/BacktestRun.tsx               (pass window to API — FIX3)
+M frontend/src/pages/ExecutionDesk.tsx             (trade_journal source + WS refresh — FIX4)
+M frontend/src/pages/QuantScreener.tsx
+   — TradingView 2-pane layout (chart LEFT + watchlist RIGHT)
+   — timeframe selector M5/M15/H1/H4/D/W
+   — localStorage persist selected symbol + TF
+   — detail cards below chart (Triple Screen + RSI + Volume + Execution + Reasoning)
+A frontend/tests/e2e/fixtures/auth.ts              (auth fixture for E2E)
+A frontend/tests/e2e/{15 spec files}                (NEW spec suite)
+M frontend/tests/e2e/{5 existing spec files}        (refactored to use auth fixture)
+```
+
+---
+
+## Phase D/F/G push (2026-05-26, committed `2cbfc8b`)
+
+Same as previously documented in this file — kept below for context.
 
 ## What landed in code 2026-05-26 (post-Tier-1-3 hardening + Phase D + F + G partial)
 
